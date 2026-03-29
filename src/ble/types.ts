@@ -8,6 +8,7 @@ export interface DiscoveredDevice {
   rssi: number | null;
   brand: Brand;
   serviceUUIDs: string[];
+  bonded?: boolean;
 }
 
 export interface DeviceInfo {
@@ -15,6 +16,7 @@ export interface DeviceInfo {
   name: string;
   brand: Brand;
   firmwareVersion?: string;
+  side?: 'left' | 'right';
 }
 
 export interface Program {

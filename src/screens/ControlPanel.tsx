@@ -1,45 +1,217 @@
 /**
- * ControlPanel — volume, program, mute controls.
- * All controls are stubs — TODO: wire to actual adapter methods.
+ * ControlPanel — volume, program, mute controls wired to the BLE adapter.
+ * Visual feedback: spinner while writing, checkmark on success, error on failure.
  */
-import React, { useState } from 'react';
-import { StyleSheet, Switch, Text, TouchableOpacity, View } from 'react-native';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
+import {
+  ActivityIndicator,
+  StyleSheet,
+  Switch,
+  Text,
+  TouchableOpacity,
+  View,
+} from 'react-native';
 import Slider from '@react-native-community/slider';
-import type { Brand } from '../ble/types';
+import type { Brand, Program } from '../ble/types';
+import { useDeviceStore } from '../store/deviceStore';
 
 interface ControlPanelProps {
   brand: Brand;
 }
 
+/** Feedback state for a single control */
+type FeedbackState = 'idle' | 'busy' | 'ok' | 'error';
+
+interface ControlFeedback {
+  state: FeedbackState;
+  message?: string;
+}
+
+/** Small inline feedback indicator */
+function FeedbackBadge({ feedback }: { feedback: ControlFeedback }) {
+  if (feedback.state === 'idle') return null;
+
+  if (feedback.state === 'busy') {
+    return (
+      <View style={badgeStyles.container}>
+        <ActivityIndicator size="small" color="#0066CC" />
+      </View>
+    );
+  }
+
+  if (feedback.state === 'ok') {
+    return (
+      <View style={badgeStyles.container}>
+        <Text style={badgeStyles.ok}>OK</Text>
+      </View>
+    );
+  }
+
+  return (
+    <View style={badgeStyles.container}>
+      <Text style={badgeStyles.error}>Failed</Text>
+      {feedback.message ? (
+        <Text style={badgeStyles.errorMsg} numberOfLines={2}>
+          {feedback.message}
+        </Text>
+      ) : null}
+    </View>
+  );
+}
+
+const badgeStyles = StyleSheet.create({
+  container: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginLeft: 8,
+    gap: 4,
+  },
+  ok: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: '#2E8B57',
+  },
+  error: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: '#CC3333',
+  },
+  errorMsg: {
+    fontSize: 11,
+    color: '#CC3333',
+    flexShrink: 1,
+  },
+});
+
+/** Run an adapter call, manage feedback state, and log the BLE op */
+function useAdapterCall() {
+  const logBleOp = useDeviceStore((s) => s.logBleOp);
+
+  return useCallback(
+    async (
+      opName: string,
+      setFeedback: (fb: ControlFeedback) => void,
+      fn: () => Promise<void>,
+    ) => {
+      setFeedback({ state: 'busy' });
+      logBleOp(opName, 'in progress...');
+      try {
+        await fn();
+        logBleOp(opName, 'OK');
+        setFeedback({ state: 'ok' });
+        setTimeout(() => setFeedback({ state: 'idle' }), 1500);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'Unknown error';
+        logBleOp(opName, `FAILED: ${msg}`);
+        setFeedback({ state: 'error', message: msg });
+        setTimeout(() => setFeedback({ state: 'idle' }), 4000);
+      }
+    },
+    [logBleOp],
+  );
+}
+
 export function ControlPanel({ brand }: ControlPanelProps) {
-  const [volume, setVolume] = useState(50);
-  const [muted, setMuted] = useState(false);
-  const [program, setProgram] = useState(0);
+  const adapter = useDeviceStore((s) => s.adapter);
+  const driverState = useDeviceStore((s) => s.driverState);
+  const setDriverState = useDeviceStore((s) => s.setDriverState);
+  const logBleOp = useDeviceStore((s) => s.logBleOp);
+  const runCall = useAdapterCall();
 
-  // TODO: Replace local state with actual adapter calls (SPEC.md §4)
-  const handleVolumeChange = (value: number) => {
-    setVolume(Math.round(value));
-    // TODO: adapter.setVolume(value) — see SPEC.md §2.x for brand-specific protocol
-  };
+  // Local UI state — initialized from driver state when available
+  const [volume, setVolume] = useState(driverState?.volume ?? 50);
+  const [muted, setMuted] = useState(driverState?.muted ?? false);
+  const [program, setProgram] = useState(driverState?.activeProgram ?? 0);
+  const [programs, setPrograms] = useState<Program[]>([
+    { index: 0, name: 'Program 1' },
+    { index: 1, name: 'Program 2' },
+    { index: 2, name: 'Program 3' },
+    { index: 3, name: 'Program 4' },
+  ]);
 
-  const handleMuteToggle = (value: boolean) => {
-    setMuted(value);
-    // TODO: adapter.setMute(value) — see SPEC.md §2.x for brand-specific protocol
-  };
+  // Feedback per control
+  const [volumeFb, setVolumeFb] = useState<ControlFeedback>({ state: 'idle' });
+  const [muteFb, setMuteFb] = useState<ControlFeedback>({ state: 'idle' });
+  const [programFb, setProgramFb] = useState<ControlFeedback>({ state: 'idle' });
+  const [refreshFb, setRefreshFb] = useState<ControlFeedback>({ state: 'idle' });
 
-  const handleProgramSelect = (index: number) => {
-    setProgram(index);
-    // TODO: adapter.setProgram(index) — see SPEC.md §2.x for brand-specific protocol
-  };
+  // Sync local state when driver state updates
+  const prevDriverState = useRef(driverState);
+  useEffect(() => {
+    if (driverState && driverState !== prevDriverState.current) {
+      if (driverState.volume !== undefined) setVolume(driverState.volume);
+      if (driverState.muted !== undefined) setMuted(driverState.muted);
+      if (driverState.activeProgram !== undefined) setProgram(driverState.activeProgram);
+    }
+    prevDriverState.current = driverState;
+  }, [driverState]);
 
-  // Placeholder programs — TODO: read from adapter.getPrograms()
-  const programs = ['Normal', 'Noisy', 'Music', 'Phone'];
+  // Load programs from adapter on mount
+  useEffect(() => {
+    if (!adapter) return;
+    void adapter.getPrograms().then(setPrograms).catch(() => {});
+  }, [adapter]);
+
+  // ── Handlers ──
+
+  const handleVolumeChangeEnd = useCallback(
+    (value: number) => {
+      const rounded = Math.round(value);
+      setVolume(rounded);
+      if (!adapter) return;
+      void runCall('setVolume', setVolumeFb, () => adapter.setVolume(rounded));
+    },
+    [adapter, runCall],
+  );
+
+  const handleMuteToggle = useCallback(
+    (value: boolean) => {
+      setMuted(value);
+      if (!adapter) return;
+      void runCall('setMute', setMuteFb, () => adapter.setMute(value));
+    },
+    [adapter, runCall],
+  );
+
+  const handleProgramSelect = useCallback(
+    (index: number) => {
+      setProgram(index);
+      if (!adapter) return;
+      void runCall('setProgram', setProgramFb, () => adapter.setProgram(index));
+    },
+    [adapter, runCall],
+  );
+
+  const handleRefresh = useCallback(() => {
+    if (!adapter) return;
+    void (async () => {
+      setRefreshFb({ state: 'busy' });
+      logBleOp('refreshState', 'in progress...');
+      try {
+        const state = await adapter.refreshState();
+        setDriverState(state);
+        logBleOp('refreshState', 'OK');
+        setRefreshFb({ state: 'ok' });
+        setTimeout(() => setRefreshFb({ state: 'idle' }), 1500);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'Unknown error';
+        logBleOp('refreshState', `FAILED: ${msg}`);
+        setRefreshFb({ state: 'error', message: msg });
+        setTimeout(() => setRefreshFb({ state: 'idle' }), 4000);
+      }
+    })();
+  }, [adapter, setDriverState, logBleOp]);
+
+  const noAdapter = !adapter;
 
   return (
     <View style={styles.container}>
       {/* Volume */}
       <View style={styles.section}>
-        <Text style={styles.sectionTitle}>Volume</Text>
+        <View style={styles.sectionHeader}>
+          <Text style={styles.sectionTitle}>Volume</Text>
+          <FeedbackBadge feedback={volumeFb} />
+        </View>
         <View style={styles.sliderRow}>
           <Text style={styles.sliderLabel}>0</Text>
           <Slider
@@ -48,11 +220,12 @@ export function ControlPanel({ brand }: ControlPanelProps) {
             maximumValue={100}
             step={1}
             value={volume}
-            onValueChange={handleVolumeChange}
+            onValueChange={setVolume}
+            onSlidingComplete={handleVolumeChangeEnd}
             minimumTrackTintColor="#0066CC"
             maximumTrackTintColor="#DDD"
             thumbTintColor="#0066CC"
-            disabled={muted}
+            disabled={muted || noAdapter || volumeFb.state === 'busy'}
           />
           <Text style={styles.sliderLabel}>100</Text>
         </View>
@@ -62,44 +235,75 @@ export function ControlPanel({ brand }: ControlPanelProps) {
       {/* Mute */}
       <View style={styles.section}>
         <View style={styles.muteRow}>
-          <Text style={styles.sectionTitle}>Mute</Text>
+          <View style={styles.sectionHeader}>
+            <Text style={styles.sectionTitle}>Mute</Text>
+            <FeedbackBadge feedback={muteFb} />
+          </View>
           <Switch
             value={muted}
             onValueChange={handleMuteToggle}
             trackColor={{ false: '#DDD', true: '#CC3333' }}
-            thumbColor={muted ? '#FFF' : '#FFF'}
+            thumbColor="#FFF"
+            disabled={noAdapter || muteFb.state === 'busy'}
           />
         </View>
       </View>
 
       {/* Programs */}
       <View style={styles.section}>
-        <Text style={styles.sectionTitle}>Program</Text>
+        <View style={styles.sectionHeader}>
+          <Text style={styles.sectionTitle}>Program</Text>
+          <FeedbackBadge feedback={programFb} />
+        </View>
         <View style={styles.programRow}>
-          {programs.map((name, index) => (
+          {programs.map((p) => (
             <TouchableOpacity
-              key={index}
+              key={p.index}
               style={[
                 styles.programButton,
-                index === program && styles.programButtonActive,
+                p.index === program && styles.programButtonActive,
               ]}
-              onPress={() => handleProgramSelect(index)}
-              activeOpacity={0.7}>
+              onPress={() => handleProgramSelect(p.index)}
+              activeOpacity={0.7}
+              disabled={noAdapter || programFb.state === 'busy'}
+            >
               <Text
                 style={[
                   styles.programText,
-                  index === program && styles.programTextActive,
+                  p.index === program && styles.programTextActive,
                 ]}>
-                {name}
+                {p.name}
               </Text>
             </TouchableOpacity>
           ))}
         </View>
       </View>
 
-      <Text style={styles.stubNote}>
-        Controls are UI-only stubs. BLE writes not yet implemented.
-      </Text>
+      {/* Refresh */}
+      <TouchableOpacity
+        style={styles.refreshButton}
+        onPress={handleRefresh}
+        activeOpacity={0.7}
+        disabled={noAdapter || refreshFb.state === 'busy'}
+      >
+        <Text style={styles.refreshText}>Refresh State</Text>
+        <FeedbackBadge feedback={refreshFb} />
+      </TouchableOpacity>
+
+      {/* Battery */}
+      {driverState?.batteryPercent !== undefined && (
+        <View style={styles.batteryRow}>
+          <Text style={styles.batteryText}>
+            Battery: {driverState.batteryPercent}%
+          </Text>
+        </View>
+      )}
+
+      {noAdapter && (
+        <Text style={styles.stubNote}>
+          Adapter not connected. Controls disabled.
+        </Text>
+      )}
     </View>
   );
 }
@@ -119,11 +323,15 @@ const styles = StyleSheet.create({
     shadowOpacity: 0.1,
     shadowRadius: 3,
   },
+  sectionHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginBottom: 8,
+  },
   sectionTitle: {
     fontSize: 16,
     fontWeight: '600',
     color: '#1A1A1A',
-    marginBottom: 8,
   },
   sliderRow: {
     flexDirection: 'row',
@@ -175,6 +383,37 @@ const styles = StyleSheet.create({
   },
   programTextActive: {
     color: '#FFF',
+  },
+  refreshButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#FFF',
+    borderRadius: 10,
+    padding: 14,
+    marginBottom: 12,
+    elevation: 2,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.1,
+    shadowRadius: 3,
+  },
+  refreshText: {
+    fontSize: 15,
+    fontWeight: '600',
+    color: '#0066CC',
+  },
+  batteryRow: {
+    backgroundColor: '#FFF',
+    borderRadius: 10,
+    padding: 14,
+    marginBottom: 12,
+    alignItems: 'center',
+  },
+  batteryText: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: '#333',
   },
   stubNote: {
     textAlign: 'center',

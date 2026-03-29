@@ -1,36 +1,50 @@
 /**
  * BLE device scanner with brand detection.
- * Scans for hearing aids and classifies them by brand using advertised service UUIDs.
+ * Scans ALL nearby BLE devices; brand is identified after connection + service discovery.
  */
 import { Device } from 'react-native-ble-plx';
 import { getBleManager, waitForPoweredOn } from './BleManager';
 import { detectBrandFromDiscovery } from '../brand/detection';
 import type { Brand, DiscoveredDevice } from './types';
 
+/** Ignore devices with signal weaker than this. */
+const MIN_RSSI = -90;
+
 export type ScanCallback = (device: DiscoveredDevice) => void;
 
 /**
- * Start scanning for BLE hearing aid devices.
- * Calls `onDevice` for each discovered device with brand detection applied.
+ * Get already-bonded/connected hearing aids.
+ * These won't appear in a BLE scan if they're already connected to Android.
+ */
+export async function getBondedDevices(): Promise<DiscoveredDevice[]> {
+  const manager = getBleManager();
+  const connected = await manager.connectedDevices([]);
+  return connected.map((device) => ({
+    id: device.id,
+    name: device.name ?? device.localName,
+    rssi: null,
+    brand: detectBrandFromDiscovery(device.serviceUUIDs ?? [], []),
+    serviceUUIDs: device.serviceUUIDs ?? [],
+    bonded: true,
+  }));
+}
+
+/**
+ * Start scanning for ALL nearby BLE devices (no service UUID filter).
+ * Brand detection is attempted from advertised UUIDs but most devices will
+ * be 'unknown' until a full GATT discovery is performed after connection.
  * Returns a stop function.
  */
 export function startScan(onDevice: ScanCallback): () => void {
   const manager = getBleManager();
   let stopped = false;
 
-  // Known hearing aid service UUID prefixes to filter scan results
-  const HEARING_AID_SERVICE_UUIDS = [
-    '56772eaf-2153-4f74-acf3-4368d99fbf5a', // Philips / Rexton POLARIS
-    '9a04f079-9840-4286-ab92-e65be0885f95', // Starkey Piccolo
-    '0000fdf0-0000-1000-8000-00805f9b34fb', // ASHA
-  ];
-
   void (async () => {
     await waitForPoweredOn();
     if (stopped) return;
 
     manager.startDeviceScan(
-      null, // scan all UUIDs — we filter in the callback
+      null,
       { allowDuplicates: false },
       (error, device) => {
         if (error || !device || stopped) return;
@@ -48,18 +62,38 @@ export function startScan(onDevice: ScanCallback): () => void {
   };
 }
 
+/**
+ * "Soft" name-based heuristic for ReSound/GN devices.
+ * ReSound Smart 3D devices often advertise as "HA" or similar short
+ * factory-default names without proprietary service UUIDs in the ad packet.
+ * These are factory BLE names, not user-customized names.
+ */
+const RESOUND_NAME_PATTERN = /^HA$|^HA\s|GN\s|Beltone|ENZO|^One\s|Quattro|Omnia|ReSound/i;
+
 function classifyDevice(device: Device): DiscoveredDevice | null {
+  // Filter out devices with very weak signal
+  if (device.rssi != null && device.rssi < MIN_RSSI) return null;
+
   const serviceUUIDs = device.serviceUUIDs ?? [];
-  const brand: Brand = detectBrandFromDiscovery(
+
+  // 1. Try UUID-based detection (high confidence)
+  let brand: Brand = detectBrandFromDiscovery(
     serviceUUIDs,
     [], // characteristics not available during scan, only after connection
-    { deviceName: device.name ?? undefined },
   );
 
-  // Return all discovered devices — even 'unknown' brand, so the user can see them
+  // 2. If UUID detection didn't match, try soft name-based heuristic
+  //    Prefer localName (from scan response) over name (from GAP)
+  if (brand === 'unknown') {
+    const advertisedName = device.localName ?? device.name;
+    if (advertisedName && RESOUND_NAME_PATTERN.test(advertisedName)) {
+      brand = 'resound';
+    }
+  }
+
   return {
     id: device.id,
-    name: device.name,
+    name: device.name ?? device.localName,
     rssi: device.rssi,
     brand,
     serviceUUIDs,

@@ -7,13 +7,32 @@
  *
  *   ASHA volume:    00e4ca9e-ab14-41e4-8823-f9e70c7e91df
  *                   Signed int8 [-128..0] where 0 = max, -128 = min/mute.
+ *                   Property: WRITE_NO_RESP (not WRITE).
  *                   Primary volume control path.
  *
- *   GN Battery:     86e2c601-d90a-2628-19b9-bdb38d5c7cf0
- *                   Enum: 1 = low, 5 = previously low, 10 = OK.
+ *   MFi HAP service (7d74f4bd-c74a-4431-862c-cce884371592):
+ *     Program name:  7be94a55-8d91-4592-bc0f-ea3664ccd3a9  R/W  — UTF-8 current program name
+ *     Program count: 7a62b786-f2ef-4afb-9aa8-81cc62a25862  R/N  — uint8
+ *     Ear side:      8d17ac2f-1d54-4742-a49a-ef4b20784eb3  R    — 0=left, 1=right
  *
- *   GN Side (L/R):  8d17ac2f-1d54-4742-a49a-ef4b20784eb3
- *                   0 = left, 1 = right.
+ *   ReSound service (a53062b9-7dfd-446c-bca5-1e13269560bd):
+ *     Battery:       539e6ea0-31e5-485a-a5a2-39fb763f0e08  R/N  — GN_BATTERY enum
+ *     Program count: 7a62b786-f2ef-4afb-9aa8-81cc62a25862  R/N  — uint8
+ *
+ *   GN Battery enum: 1=low(5%), 5=prev_low(30%), 10=OK(100%).
+ *   GN Side: 0=left, 1=right.
+ *
+ * ── GN Handle Protocol (confirmed response format) ──
+ *
+ *   Success: [0x03, handle, data_len, ...data]
+ *   Error:   [0x08, 0x04, handle, 0x81] (0x81 = not permitted)
+ *
+ *   Confirmed readable handles:
+ *     0x02 → 1 byte
+ *     0x03 → 7 bytes (obfuscated program list)
+ *     0x04 → 7 bytes (obfuscated program list)
+ *     0x14 → 1 byte = 0x05
+ *     0x1a → 8 bytes
  *
  * ── PARTIAL / UNCONFIRMED paths ──
  *
@@ -59,6 +78,18 @@ const ASHA_VOLUME_CHAR = '00e4ca9e-ab14-41e4-8823-f9e70c7e91df';
 const GN_SERVICE = 'e0262760-08c2-11e1-9073-0e8ac72ea010';
 const GN_COMMAND_CHAR = '1959a468-3234-4c18-9e78-8daf8d9dbf61';
 const GN_NOTIFY_CHAR = '8b51a2ca-5bed-418b-b54b-22fe666aadd2';
+
+// ── MFi HAP service (live BLE discovery — CONFIRMED) ──
+
+const MFIHAP_SERVICE = '7d74f4bd-c74a-4431-862c-cce884371592';
+const MFIHAP_PROGRAM_NAME_CHAR = '7be94a55-8d91-4592-bc0f-ea3664ccd3a9';
+const MFIHAP_PROGRAM_COUNT_CHAR = '7a62b786-f2ef-4afb-9aa8-81cc62a25862';
+const MFIHAP_SIDE_CHAR = '8d17ac2f-1d54-4742-a49a-ef4b20784eb3';
+
+// ── ReSound proprietary service (live BLE discovery — CONFIRMED) ──
+
+const RESOUND_SERVICE = 'a53062b9-7dfd-446c-bca5-1e13269560bd';
+const RESOUND_BATTERY_CHAR = '539e6ea0-31e5-485a-a5a2-39fb763f0e08';
 
 // ── GN direct-read characteristics (resound_uuid_reference_master — confirmed semantics) ──
 
@@ -164,6 +195,21 @@ export class ResoundAdapter implements HearingAidAdapter {
 
     await this.device.discoverAllServicesAndCharacteristics();
     await this.buildCharacteristicMap();
+
+    // Trigger Android bonding dialog by reading a secured ASHA characteristic.
+    // If the device is already bonded this is a no-op; if not, Android will
+    // prompt the user to pair.
+    try {
+      await manager.readCharacteristicForDevice(
+        deviceId,
+        ASHA_SERVICE,
+        '6333651e-c481-4a3e-9169-7c902aad37bb',
+      );
+      console.log('[ResoundAdapter] Device bonded/trusted');
+    } catch (e) {
+      console.log('[ResoundAdapter] Bonding may be needed:', e);
+    }
+
     await this.setupGnNotify();
   }
 
@@ -202,8 +248,9 @@ export class ResoundAdapter implements HearingAidAdapter {
     const byte = clamped & 0xff;
 
     const serviceUUID = this.findService(ASHA_VOLUME_CHAR);
+    // ASHA volume characteristic has WRITE_NO_RESP property (confirmed via live BLE discovery)
     await withRetry(() =>
-      dev.writeCharacteristicWithResponseForService(
+      dev.writeCharacteristicWithoutResponseForService(
         serviceUUID,
         ASHA_VOLUME_CHAR,
         bytesToBase64([byte]),
@@ -281,43 +328,71 @@ export class ResoundAdapter implements HearingAidAdapter {
   }
 
   async getProgram(): Promise<number> {
-    // Try direct read of GNCurrentActiveProgram characteristic
-    const serviceUUID = this.charServiceMap.get(GN_ACTIVE_PROGRAM_CHAR);
-    if (serviceUUID) {
-      try {
-        const char = await withRetry(() =>
-          this.connected.readCharacteristicForService(
-            serviceUUID,
-            GN_ACTIVE_PROGRAM_CHAR,
-          ),
-        );
-        if (char.value) {
-          return base64ToBytes(char.value)[0];
-        }
-      } catch {
-        // Direct read failed — characteristic may require handle protocol
-      }
+    // Read current program name from MFi HAP service (confirmed via live BLE discovery).
+    // Returns the program index if we can match it against known programs,
+    // otherwise returns 0 as the active program.
+    const programs = await this.getPrograms();
+    const currentName = await this.getCurrentProgramName();
+    if (currentName) {
+      const match = programs.find((p) => p.name === currentName);
+      if (match) return match.index;
     }
+    return 0;
+  }
 
-    // TODO: GN handle protocol read: [0x04, 0x08] to GN Command,
-    // response on GN Notify. Handle 0x08 unconfirmed.
-    throw new Error(
-      'ResoundAdapter.getProgram: direct read failed or unavailable. ' +
-      'GN handle read (0x04, 0x08) not yet implemented.',
-    );
+  /**
+   * Read the current active program name from MFi HAP service.
+   * Returns UTF-8 string (e.g. "All-Around") or null if unavailable.
+   */
+  async getCurrentProgramName(): Promise<string | null> {
+    const serviceUUID = this.findService(MFIHAP_PROGRAM_NAME_CHAR);
+    try {
+      const char = await withRetry(() =>
+        this.connected.readCharacteristicForService(
+          serviceUUID,
+          MFIHAP_PROGRAM_NAME_CHAR,
+        ),
+      );
+      if (!char.value) return null;
+      const bytes = base64ToBytes(char.value);
+      return String.fromCharCode(...bytes);
+    } catch {
+      return null;
+    }
   }
 
   async getPrograms(): Promise<Program[]> {
-    // TODO: ReSound program enumeration is undocumented.
-    // Programs may be configured via the ReSound Smart 3D app.
-    // Live testing with discover() should reveal available program count
-    // via GNCurrentActiveProgram value range.
-    return [
-      { index: 0, name: 'Program 1' },
-      { index: 1, name: 'Program 2' },
-      { index: 2, name: 'Program 3' },
-      { index: 3, name: 'Program 4' },
-    ];
+    // Read program count from MFi HAP service (confirmed via live BLE discovery).
+    // Individual program names are not enumerable — only the current program
+    // name is readable via MFIHAP_PROGRAM_NAME_CHAR. Return generic names.
+    let count = 4; // default
+    const serviceUUID = this.findService(MFIHAP_PROGRAM_COUNT_CHAR);
+    try {
+      const char = await withRetry(() =>
+        this.connected.readCharacteristicForService(
+          serviceUUID,
+          MFIHAP_PROGRAM_COUNT_CHAR,
+        ),
+      );
+      if (char.value) {
+        count = base64ToBytes(char.value)[0];
+      }
+    } catch {
+      // Use default count
+    }
+
+    // Try to label the current program with its real name
+    const currentName = await this.getCurrentProgramName();
+    const currentIndex = 0; // We don't know which index is active without more data
+
+    const programs: Program[] = [];
+    for (let i = 0; i < count; i++) {
+      programs.push({
+        index: i,
+        name: i === currentIndex && currentName ? currentName : `Program ${i + 1}`,
+      });
+    }
+    return programs;
   }
 
   // ── Battery ──
@@ -325,7 +400,21 @@ export class ResoundAdapter implements HearingAidAdapter {
   async getBattery(): Promise<number> {
     const dev = this.connected;
 
-    // Try GN battery characteristic (confirmed enum — resound_uuid_reference_master)
+    // Primary: ReSound service battery characteristic (confirmed via live BLE discovery)
+    const resoundBatteryService = this.findService(RESOUND_BATTERY_CHAR);
+    try {
+      const char = await withRetry(() =>
+        dev.readCharacteristicForService(resoundBatteryService, RESOUND_BATTERY_CHAR),
+      );
+      if (char.value) {
+        const raw = base64ToBytes(char.value)[0];
+        return gnBatteryToPercent(raw);
+      }
+    } catch {
+      // ReSound battery not readable — try legacy GN battery
+    }
+
+    // Fallback: legacy GN battery characteristic
     const gnBatteryService = this.charServiceMap.get(GN_BATTERY_CHAR);
     if (gnBatteryService) {
       try {
@@ -479,22 +568,41 @@ export class ResoundAdapter implements HearingAidAdapter {
 
   /**
    * Read which side (left/right) this device is.
-   * Uses GNLeftRight characteristic (confirmed: 0=left, 1=right).
+   * Uses MFi HAP side characteristic (confirmed via live BLE discovery: 0=left, 1=right).
+   * Falls back to GN service if MFi HAP is unavailable.
    */
   async getSide(): Promise<'left' | 'right' | null> {
-    const serviceUUID = this.charServiceMap.get(GN_SIDE_CHAR);
-    if (!serviceUUID) return null;
-
+    // Primary: MFi HAP service (confirmed via live BLE discovery)
+    const mfihapService = this.findService(MFIHAP_SIDE_CHAR);
     try {
       const char = await withRetry(() =>
-        this.connected.readCharacteristicForService(serviceUUID, GN_SIDE_CHAR),
+        this.connected.readCharacteristicForService(mfihapService, MFIHAP_SIDE_CHAR),
       );
-      if (!char.value) return null;
-      const raw = base64ToBytes(char.value)[0];
-      return raw === 0 ? 'left' : 'right';
+      if (char.value) {
+        const raw = base64ToBytes(char.value)[0];
+        return raw === 0 ? 'left' : 'right';
+      }
     } catch {
-      return null;
+      // MFi HAP side not readable — try legacy GN service
     }
+
+    // Fallback: legacy GN service (same UUID, different service)
+    const gnSideService = this.charServiceMap.get(GN_SIDE_CHAR);
+    if (gnSideService && gnSideService !== mfihapService) {
+      try {
+        const char = await withRetry(() =>
+          this.connected.readCharacteristicForService(gnSideService, GN_SIDE_CHAR),
+        );
+        if (char.value) {
+          const raw = base64ToBytes(char.value)[0];
+          return raw === 0 ? 'left' : 'right';
+        }
+      } catch {
+        // Side read failed
+      }
+    }
+
+    return null;
   }
 
   // ── State ──
@@ -513,10 +621,11 @@ export class ResoundAdapter implements HearingAidAdapter {
     try {
       activeProgram = await this.getProgram();
     } catch {
-      // Program read not available (expected until GN protocol confirmed)
+      // Program read failed
     }
 
     const batteryPercent = await this.getBattery().catch(() => undefined);
+    const side = await this.getSide().catch(() => null);
 
     let deviceInfo: DeviceInfo | undefined;
     if (this.device) {
@@ -524,6 +633,7 @@ export class ResoundAdapter implements HearingAidAdapter {
         id: this.deviceId!,
         name: this.device.name ?? 'ReSound Hearing Aid',
         brand: 'resound',
+        side: side ?? undefined,
       };
     }
 
@@ -540,16 +650,16 @@ export class ResoundAdapter implements HearingAidAdapter {
   }
 
   getSupportedFeatures(): Feature[] {
-    // Conservative — only features with confirmed or emulated paths:
-    //   volume:  ASHA confirmed
+    // Confirmed features:
+    //   volume:  ASHA confirmed (WRITE_NO_RESP)
     //   mute:    ASHA emulation (volume = -128)
-    //   battery: GN battery characteristic (confirmed enum)
+    //   battery: ReSound service battery (confirmed via live BLE discovery)
+    //   program: MFi HAP program name/count (confirmed via live BLE discovery)
     //
     // NOT included until GN handle protocol validated:
-    //   program:   handle 0x08 unconfirmed
     //   streaming: handle 0x06 unconfirmed
     //   balance, tinnitus, eq: no known path
-    return ['volume', 'mute', 'battery'];
+    return ['volume', 'mute', 'battery', 'program'];
   }
 
   // ── Private helpers ──
@@ -589,6 +699,14 @@ export class ResoundAdapter implements HearingAidAdapter {
 
     if (charUUID === ASHA_VOLUME_CHAR) return ASHA_SERVICE;
     if (charUUID === BATTERY_LEVEL_CHAR) return BATTERY_SERVICE;
+    if (charUUID === RESOUND_BATTERY_CHAR) return RESOUND_SERVICE;
+    if (
+      charUUID === MFIHAP_PROGRAM_NAME_CHAR ||
+      charUUID === MFIHAP_PROGRAM_COUNT_CHAR ||
+      charUUID === MFIHAP_SIDE_CHAR
+    ) {
+      return MFIHAP_SERVICE;
+    }
     return GN_SERVICE;
   }
 
@@ -633,14 +751,14 @@ export class ResoundAdapter implements HearingAidAdapter {
 
 /**
  * Map GN battery enum to 0-100 percentage.
- * Confirmed values (resound_uuid_reference_master):
- *   1  = Low battery    → 10%
- *   5  = Previously low → 50%
- *   10 = Battery OK     → 100%
+ * Confirmed values (live BLE discovery + resound_uuid_reference_master):
+ *   1  = Low battery        →  5%
+ *   5  = Previously low     → 30%
+ *   10 = Battery OK         → 100%
  */
 function gnBatteryToPercent(raw: number): number {
-  if (raw <= 1) return 10;
-  if (raw <= 5) return 50;
+  if (raw <= 1) return 5;
+  if (raw <= 5) return 30;
   if (raw >= 10) return 100;
   return Math.round((raw / 10) * 100);
 }

@@ -10,11 +10,13 @@ import { createStackNavigator } from '@react-navigation/stack';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import { HomeScreen } from './src/screens/HomeScreen';
 import { DeviceScreen } from './src/screens/DeviceScreen';
+import { BleProbeScreen } from './src/screens/BleProbeScreen';
 import type { DiscoveredDevice } from './src/ble/types';
 
 export type RootStackParamList = {
   Home: undefined;
   Device: { device: DiscoveredDevice };
+  BleProbe: { deviceId: string };
 };
 
 const Stack = createStackNavigator<RootStackParamList>();
@@ -45,6 +47,11 @@ function App(): React.JSX.Element {
               options={({ route }) => ({
                 title: route.params.device.name ?? 'Device',
               })}
+            />
+            <Stack.Screen
+              name="BleProbe"
+              component={BleProbeScreen}
+              options={{ title: 'BLE Probe' }}
             />
           </Stack.Navigator>
         </NavigationContainer>
