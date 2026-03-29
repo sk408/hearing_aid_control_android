@@ -59,9 +59,10 @@
  *     GNHiState:              8d552f91-15d0-4628-a03f-1a64fc88fa51
  *     GNFeatureSupport:       650c3a00-cb6d-467d-a20b-3544f189d8af  (4-byte bitfield)
  *
- * Status: ASHA volume is the confirmed primary volume path.
- *         GN proprietary control requires live handle discovery + validation.
- *         Use discover() to enumerate available handles on a connected device.
+ * Status: HA gain uses GN mic attenuation (UUID / handle 0x05) when exposed;
+ *         ASHA volume is fallback (streaming-oriented). Program: GNCurrentActiveProgram
+ *         direct write or [0x03,0x08,idx]. Official app may encrypt GN command frames —
+ *         if writes are rejected, capture plaintext/encrypt boundary (phase3 docs).
  */
 import type { Device } from 'react-native-ble-plx';
 import { getBleManager } from '../ble/BleManager';
@@ -96,6 +97,10 @@ const RESOUND_BATTERY_CHAR = '539e6ea0-31e5-485a-a5a2-39fb763f0e08';
 const GN_BATTERY_CHAR = '86e2c601-d90a-2628-19b9-bdb38d5c7cf0';
 const GN_SIDE_CHAR = '8d17ac2f-1d54-4742-a49a-ef4b20784eb3';
 const GN_ACTIVE_PROGRAM_CHAR = 'dc82f820-63ac-f82f-1e89-372fde4151f4';
+/** GN security capability — trust bootstrap per resound_phase2_static.md §5 */
+const GN_SECURITY_CAP_CHAR = '12257119-ddcb-4a12-9a08-1cd4df7921bb';
+/** Microphone / HA gain (not streaming-only ASHA volume) — Dooku3 handle 0x05 */
+const GN_MIC_ATTENUATION_CHAR = '32c9322d-6b17-11cf-0234-6f0da5eafd75';
 
 // ── Standard BLE Battery Service ──
 
@@ -169,6 +174,8 @@ export class ResoundAdapter implements HearingAidAdapter {
   private deviceId: string | null = null;
   private notifySubscription: { remove: () => void } | null = null;
   private preMuteVolume = 50;
+  /** GN trust byte sequence written once per connection when the characteristic exists */
+  private gnTrustBootstrapDone = false;
 
   /** Characteristic UUID (lowercase) → parent service UUID, built during connect */
   private charServiceMap = new Map<string, string>();
@@ -227,28 +234,65 @@ export class ResoundAdapter implements HearingAidAdapter {
       this.device = null;
       this.deviceId = null;
       this.charServiceMap.clear();
+      this.gnTrustBootstrapDone = false;
     }
   }
 
-  // ── Volume (ASHA path — CONFIRMED) ──
+  // ── Volume ──
   //
-  // ASHA volume characteristic: signed int8 [-128..0]
-  //   0    = maximum volume
-  //   -128 = minimum / mute
-  //
-  // Note: ASHA volume controls the streaming audio volume, not the
-  // hearing aid microphone gain. Microphone volume requires the GN
-  // handle protocol (handle 0x05, unconfirmed). This is the only
-  // confirmed volume path for ReSound.
+  // Primary: GN mic attenuation (Dooku3 handle 0x05 / UUID 32c9322d…) — HA gain.
+  // Fallback: ASHA int8 volume — streaming-oriented; used when GN path is unavailable.
 
   async setVolume(level: number, _ear?: 'left' | 'right' | 'both'): Promise<void> {
+    const clampedLevel = Math.max(0, Math.min(100, level));
+    await this.ensureGnTrustBootstrap();
+
+    const attenuation =
+      clampedLevel <= 0
+        ? 0
+        : Math.max(1, Math.min(255, Math.round((clampedLevel / 100) * 255)));
+
+    let program = await this.readRawActiveProgramIndex();
+    if (program === null) program = 0;
+
+    const micKey = GN_MIC_ATTENUATION_CHAR.toLowerCase();
+    if (this.charServiceMap.has(micKey)) {
+      const svc = this.findService(GN_MIC_ATTENUATION_CHAR);
+      try {
+        await this.writeCharacteristicBothModes(svc, GN_MIC_ATTENUATION_CHAR, [
+          program,
+          attenuation,
+        ]);
+        return;
+      } catch {
+        try {
+          await this.writeCharacteristicBothModes(svc, GN_MIC_ATTENUATION_CHAR, [
+            attenuation,
+          ]);
+          return;
+        } catch {
+          // try command tunnel
+        }
+      }
+    }
+
+    try {
+      await this.writeGnCommandFrame([0x03, 0x05, program, attenuation]);
+      return;
+    } catch {
+      // ASHA fallback
+    }
+
+    await this.setVolumeAsha(clampedLevel);
+  }
+
+  private async setVolumeAsha(level: number): Promise<void> {
     const dev = this.connected;
     const ashaLevel = Math.round((level / 100) * 128) - 128;
     const clamped = Math.max(-128, Math.min(0, ashaLevel));
     const byte = clamped & 0xff;
 
     const serviceUUID = this.findService(ASHA_VOLUME_CHAR);
-    // ASHA volume characteristic has WRITE_NO_RESP property (confirmed via live BLE discovery)
     await withRetry(() =>
       dev.writeCharacteristicWithoutResponseForService(
         serviceUUID,
@@ -259,6 +303,26 @@ export class ResoundAdapter implements HearingAidAdapter {
   }
 
   async getVolume(): Promise<number> {
+    const micKey = GN_MIC_ATTENUATION_CHAR.toLowerCase();
+    if (this.charServiceMap.has(micKey)) {
+      try {
+        const char = await withRetry(() =>
+          this.connected.readCharacteristicForService(
+            this.findService(GN_MIC_ATTENUATION_CHAR),
+            GN_MIC_ATTENUATION_CHAR,
+          ),
+        );
+        if (char.value) {
+          const b = base64ToBytes(char.value);
+          const att = b.length >= 2 ? b[b.length - 1] : b[0];
+          if (att === 0) return 0;
+          return Math.round((att / 255) * 100);
+        }
+      } catch {
+        // ASHA
+      }
+    }
+
     const dev = this.connected;
     const serviceUUID = this.findService(ASHA_VOLUME_CHAR);
     const char = await withRetry(() =>
@@ -290,47 +354,32 @@ export class ResoundAdapter implements HearingAidAdapter {
     return volume === 0;
   }
 
-  // ── Program (GN handle protocol — NOT CONFIRMED) ──
+  // ── Program (GN — resound_phase2_static.md §6.3) ──
+  //
+  // Try direct GNCurrentActiveProgram GATT write, then command frame [0x03, 0x08, idx].
 
-  /**
-   * Set active program via GN handle protocol.
-   *
-   * NOT IMPLEMENTED — requires confirmed handle ID.
-   *
-   * Candidate frame (command_dictionary.md, PARTIAL confidence):
-   *   [0x03, 0x08, programIndex]
-   *   Written to GN Command: 1959a468-3234-4c18-9e78-8daf8d9dbf61
-   *
-   * To confirm:
-   *   1. Run discover() to verify handle 0x08 exists
-   *   2. Capture nRF Sniffer trace of ReSound Smart 3D app changing programs
-   *   3. Live write test on connected ReSound device
-   *
-   * Alternative: direct write to GNCurrentActiveProgram characteristic
-   *   dc82f820-63ac-f82f-1e89-372fde4151f4 — but whether this is
-   *   directly writable (vs tunneled via handle protocol) is unknown.
-   */
-  async setProgram(_index: number): Promise<void> {
-    // TODO: Implement once handle 0x08 is validated via discover() + sniffing
-    //
-    // Expected implementation:
-    //   const serviceUUID = this.findService(GN_COMMAND_CHAR);
-    //   await withRetry(() =>
-    //     dev.writeCharacteristicWithResponseForService(
-    //       serviceUUID, GN_COMMAND_CHAR,
-    //       bytesToBase64([0x03, 0x08, index & 0xff]),
-    //     ),
-    //   );
-    throw new Error(
-      'ResoundAdapter.setProgram: GN handle protocol opcodes not confirmed. ' +
-      'Run discover() to enumerate handles, then validate handle 0x08.',
-    );
+  async setProgram(index: number): Promise<void> {
+    const idx = ((Math.floor(index) % 256) + 256) % 256;
+    await this.ensureGnTrustBootstrap();
+
+    const progKey = GN_ACTIVE_PROGRAM_CHAR.toLowerCase();
+    if (this.charServiceMap.has(progKey)) {
+      const svc = this.findService(GN_ACTIVE_PROGRAM_CHAR);
+      try {
+        await this.writeCharacteristicBothModes(svc, GN_ACTIVE_PROGRAM_CHAR, [idx]);
+        return;
+      } catch {
+        // command tunnel
+      }
+    }
+
+    await this.writeGnCommandFrame([0x03, 0x08, idx]);
   }
 
   async getProgram(): Promise<number> {
-    // Read current program name from MFi HAP service (confirmed via live BLE discovery).
-    // Returns the program index if we can match it against known programs,
-    // otherwise returns 0 as the active program.
+    const raw = await this.readRawActiveProgramIndex();
+    if (raw !== null) return raw;
+
     const programs = await this.getPrograms();
     const currentName = await this.getCurrentProgramName();
     if (currentName) {
@@ -381,9 +430,8 @@ export class ResoundAdapter implements HearingAidAdapter {
       // Use default count
     }
 
-    // Try to label the current program with its real name
     const currentName = await this.getCurrentProgramName();
-    const currentIndex = 0; // We don't know which index is active without more data
+    const currentIndex = (await this.readRawActiveProgramIndex()) ?? 0;
 
     const programs: Program[] = [];
     for (let i = 0; i < count; i++) {
@@ -651,13 +699,13 @@ export class ResoundAdapter implements HearingAidAdapter {
 
   getSupportedFeatures(): Feature[] {
     // Confirmed features:
-    //   volume:  ASHA confirmed (WRITE_NO_RESP)
-    //   mute:    ASHA emulation (volume = -128)
+    //   volume:  GN mic attenuation + ASHA fallback
+    //   mute:    GN attenuation 0 + ASHA min
     //   battery: ReSound service battery (confirmed via live BLE discovery)
-    //   program: MFi HAP program name/count (confirmed via live BLE discovery)
+    //   program: GN active program + MFi HAP metadata
     //
-    // NOT included until GN handle protocol validated:
-    //   streaming: handle 0x06 unconfirmed
+    // NOT included until validated on hardware:
+    //   streaming: dedicated stream attenuation handle 0x06
     //   balance, tinnitus, eq: no known path
     return ['volume', 'mute', 'battery', 'program'];
   }
@@ -708,6 +756,107 @@ export class ResoundAdapter implements HearingAidAdapter {
       return MFIHAP_SERVICE;
     }
     return GN_SERVICE;
+  }
+
+  private async readRawActiveProgramIndex(): Promise<number | null> {
+    const key = GN_ACTIVE_PROGRAM_CHAR.toLowerCase();
+    if (!this.charServiceMap.has(key)) return null;
+    try {
+      const char = await withRetry(() =>
+        this.connected.readCharacteristicForService(
+          this.findService(GN_ACTIVE_PROGRAM_CHAR),
+          GN_ACTIVE_PROGRAM_CHAR,
+        ),
+      );
+      if (!char.value) return null;
+      return base64ToBytes(char.value)[0];
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * GN trust bootstrap from resound_phase2_static.md §5 + protocol_frames §7.
+   * Best-effort; required for some firmware builds before handle writes succeed.
+   */
+  private async ensureGnTrustBootstrap(): Promise<void> {
+    if (this.gnTrustBootstrapDone) return;
+    this.gnTrustBootstrapDone = true;
+
+    const key = GN_SECURITY_CAP_CHAR.toLowerCase();
+    if (!this.charServiceMap.has(key)) return;
+
+    const svc = this.findService(GN_SECURITY_CAP_CHAR);
+    const payload = bytesToBase64([4, 0, 0, 0, 0]);
+    try {
+      await withRetry(async () => {
+        try {
+          await this.connected.writeCharacteristicWithResponseForService(
+            svc,
+            GN_SECURITY_CAP_CHAR,
+            payload,
+          );
+        } catch {
+          await this.connected.writeCharacteristicWithoutResponseForService(
+            svc,
+            GN_SECURITY_CAP_CHAR,
+            payload,
+          );
+        }
+      });
+    } catch (e) {
+      console.log('[ResoundAdapter] GN trust bootstrap skipped:', e);
+    }
+  }
+
+  private async writeCharacteristicBothModes(
+    serviceUUID: string,
+    charUUID: string,
+    bytes: number[],
+  ): Promise<void> {
+    const b64 = bytesToBase64(bytes);
+    const dev = this.connected;
+    try {
+      await withRetry(() =>
+        dev.writeCharacteristicWithResponseForService(
+          serviceUUID,
+          charUUID,
+          b64,
+        ),
+      );
+      return;
+    } catch {
+      await withRetry(() =>
+        dev.writeCharacteristicWithoutResponseForService(
+          serviceUUID,
+          charUUID,
+          b64,
+        ),
+      );
+    }
+  }
+
+  private async writeGnCommandFrame(frame: number[]): Promise<void> {
+    const cmdSvc = this.findService(GN_COMMAND_CHAR);
+    const b64 = bytesToBase64(frame);
+    const dev = this.connected;
+    try {
+      await withRetry(() =>
+        dev.writeCharacteristicWithResponseForService(
+          cmdSvc,
+          GN_COMMAND_CHAR,
+          b64,
+        ),
+      );
+    } catch {
+      await withRetry(() =>
+        dev.writeCharacteristicWithoutResponseForService(
+          cmdSvc,
+          GN_COMMAND_CHAR,
+          b64,
+        ),
+      );
+    }
   }
 
   /**
