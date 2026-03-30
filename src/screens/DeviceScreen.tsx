@@ -6,6 +6,7 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import {
   ActivityIndicator,
+  Alert,
   ScrollView,
   StyleSheet,
   Text,
@@ -107,6 +108,9 @@ export function DeviceScreen({ route }: DeviceScreenProps) {
         setState({ status: 'unsupported' });
         return;
       }
+      adapter.onRebootRequired = (message) => {
+        Alert.alert('Reboot Required', message, [{ text: 'OK' }]);
+      };
 
       logBleOp('adapter.connect', 'in progress...');
       await adapter.connect(device.id);
@@ -143,6 +147,9 @@ export function DeviceScreen({ route }: DeviceScreenProps) {
         try {
           const adapter = createAdapter(device.brand);
           if (!adapter) return;
+          adapter.onRebootRequired = (message) => {
+            Alert.alert('Reboot Required', message, [{ text: 'OK' }]);
+          };
           logBleOp('adapter.connect', 'in progress...');
           await adapter.connect(device.id);
           logBleOp('adapter.connect', 'OK');

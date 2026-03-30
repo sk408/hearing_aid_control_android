@@ -219,6 +219,8 @@ export class ResoundAdapter implements HearingAidAdapter {
   /** Trust key handler — manages ECDH + SHA-256 derivation during bond */
   private trustKeyHandler: P6TrustKeyHandler | null = null;
 
+  public onRebootRequired?: (message: string) => void;
+
   private get connected(): Device {
     if (!this.device) {
       throw new Error('ResoundAdapter: not connected — call connect() first');
@@ -1426,7 +1428,10 @@ export class ResoundAdapter implements HearingAidAdapter {
       // Check for reboot indicator (0x13 = HI will reboot)
       let gnSvc2 = gnSvc;
       if (resp1[1] === 0x13) {
-        console.log('[ResoundAdapter] HI rebooting — waiting for reconnect...');
+        this.onRebootRequired?.(
+          'Please reboot your hearing aid now (open/close the battery door or place in charger) to complete pairing.',
+        );
+        console.log('[ResoundAdapter] Waiting for user to reboot HI...');
         this.bondInfo.phase = 'awaiting_reboot';
         const manager = getBleManager();
 

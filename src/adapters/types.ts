@@ -36,6 +36,9 @@ export interface HearingAidAdapter {
   setStreamingVolume?(level: number): Promise<void>;
   setEQ?(bass: number, mid: number, treble: number): Promise<void>;
 
+  // Callbacks
+  onRebootRequired?: (message: string) => void;
+
   // State
   refreshState(): Promise<DriverState>;
   getSupportedFeatures(): Feature[];
