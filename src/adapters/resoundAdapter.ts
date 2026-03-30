@@ -1421,9 +1421,43 @@ export class ResoundAdapter implements HearingAidAdapter {
       if (!resp1 || resp1.length < 2) {
         throw new Error('No stage 1 response');
       }
+      console.log('[ResoundAdapter] Stage 1 response:', resp1.map(b => '0x' + b.toString(16).padStart(2, '0')).join(' '));
 
-      // Check for reboot indicator — if HI reboots, we need to wait and reconnect.
-      // For now, proceed directly to stage 2 (works when reboot is not required).
+      // Check for reboot indicator (0x13 = HI will reboot)
+      let gnSvc2 = gnSvc;
+      if (resp1[1] === 0x13) {
+        console.log('[ResoundAdapter] HI rebooting — waiting for reconnect...');
+        this.bondInfo.phase = 'awaiting_reboot';
+        const manager = getBleManager();
+
+        // Wait for disconnect
+        await new Promise<void>((resolve) => {
+          const sub = manager.onDeviceDisconnected(this.deviceId!, () => {
+            sub.remove();
+            resolve();
+          });
+          setTimeout(() => { sub.remove(); resolve(); }, 10000); // timeout fallback
+        });
+
+        // Wait for reconnect
+        let reconnected = false;
+        for (let i = 0; i < 30; i++) {
+          await new Promise(r => setTimeout(r, 2000));
+          try {
+            const connected = await manager.isDeviceConnected(this.deviceId!);
+            if (connected) { reconnected = true; break; }
+          } catch { /* device not available yet */ }
+        }
+        if (!reconnected) throw new Error('HI did not reconnect after reboot');
+
+        // Re-establish services
+        this.device = await manager.connectToDevice(this.deviceId!, { requestMTU: 512 });
+        await this.device.discoverAllServicesAndCharacteristics();
+        await this.buildCharacteristicMap();
+        await this.setupGnNotify();
+        gnSvc2 = this.resolveGnService();
+        console.log('[ResoundAdapter] Reconnected after HI reboot');
+      }
 
       // Stage 2: GenerateAuth type 2
       const auth2 = handler.generateAuth(aesEncoder, BOND_TYPE_BOOT_STAGE2, keyIndex);
@@ -1433,13 +1467,25 @@ export class ResoundAdapter implements HearingAidAdapter {
 
       await withRetry(() =>
         this.connected.writeCharacteristicWithResponseForService(
-          gnSvc, GN_TRUSTED_APP_CHALLENGE_CHAR, bytesToBase64(Array.from(auth2)),
+          gnSvc2, GN_TRUSTED_APP_CHALLENGE_CHAR, bytesToBase64(Array.from(auth2)),
         ),
       );
 
-      const resp2 = await resp2Promise;
+      let resp2 = await resp2Promise;
       if (!resp2 || resp2.length < 2) {
         throw new Error('No stage 2 response');
+      }
+      console.log('[ResoundAdapter] Stage 2 response:', resp2.map(b => '0x' + b.toString(16).padStart(2, '0')).join(' '));
+
+      // If stage 2 response is only a 2-byte ack, wait for the actual verification payload
+      if (resp2.length === 2) {
+        console.log('[ResoundAdapter] Stage 2 was ack-only, awaiting verification payload...');
+        const verifyResp = await this.awaitGnNotifyResponse(15000);
+        if (!verifyResp || verifyResp.length < 2) {
+          throw new Error('No verification payload after stage 2 ack');
+        }
+        console.log('[ResoundAdapter] Verification payload:', verifyResp.map(b => '0x' + b.toString(16).padStart(2, '0')).join(' '));
+        resp2 = verifyResp;
       }
 
       // Verify "HI says hi"
