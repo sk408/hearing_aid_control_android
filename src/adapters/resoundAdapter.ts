@@ -932,6 +932,12 @@ export class ResoundAdapter implements HearingAidAdapter {
   /**
    * Subscribe to GN Notify for handle-based response data.
    * Idempotent — will not double-subscribe.
+   *
+   * Opcodes (from HandleBasedPlatform.Notification switch):
+   *   0x01 = Bond ack           0x05 = Blob data
+   *   0x02 = Notification vector 0x06 = Discover response
+   *   0x03 = Read out           0x07 = Discover end
+   *   0x04 = Notification payload 0x08 = Error
    */
   private async setupGnNotify(): Promise<void> {
     if (this.notifySubscription) return;
@@ -950,10 +956,7 @@ export class ResoundAdapter implements HearingAidAdapter {
           }
           if (characteristic?.value) {
             const data = base64ToBytes(characteristic.value);
-            console.log(
-              '[ResoundAdapter] GN notify:',
-              data.map((b) => '0x' + b.toString(16).padStart(2, '0')).join(' '),
-            );
+            this.parseGnNotify(data);
             this.onGnNotify(data);
           }
         },
@@ -964,6 +967,128 @@ export class ResoundAdapter implements HearingAidAdapter {
       );
     }
   }
+
+  /**
+   * Parse and log GN notify payload by opcode.
+   * Opcode is the first byte; remainder is opcode-specific data.
+   * From HandleBasedPlatform.Notification in decompiled Smart 3D 1.3.0.
+   */
+  private parseGnNotify(data: number[]): void {
+    const hex = (b: number) => '0x' + b.toString(16).padStart(2, '0');
+    const hexDump = data.map(hex).join(' ');
+
+    if (data.length === 0) {
+      console.warn('[ResoundAdapter] GN notify: empty payload');
+      return;
+    }
+
+    const opcode = data[0];
+    const payload = data.slice(1);
+
+    switch (opcode) {
+      case 0x01:
+        console.log('[ResoundAdapter] GN notify [0x01 Bond Ack]:', hexDump);
+        break;
+      case 0x02:
+        console.log('[ResoundAdapter] GN notify [0x02 Notification Vector]:', hexDump);
+        break;
+      case 0x03:
+        console.log(
+          '[ResoundAdapter] GN notify [0x03 Read Out] handle=',
+          payload.length > 0 ? hex(payload[0]) : '?',
+          'data=',
+          payload.slice(1).map(hex).join(' '),
+        );
+        break;
+      case 0x04:
+        console.log('[ResoundAdapter] GN notify [0x04 Notification Payload]:', hexDump);
+        break;
+      case 0x05:
+        console.log('[ResoundAdapter] GN notify [0x05 Blob]:', hexDump);
+        break;
+      case 0x06:
+        console.log('[ResoundAdapter] GN notify [0x06 Discover]:', hexDump);
+        break;
+      case 0x07:
+        console.log('[ResoundAdapter] GN notify [0x07 Discover End]:', hexDump);
+        break;
+      case 0x08:
+        this.logGnError(payload);
+        break;
+      default:
+        console.log('[ResoundAdapter] GN notify [unknown opcode', hex(opcode), ']:', hexDump);
+        // Check if payload looks encrypted
+        if (data.length >= 8 && looksEncrypted(data)) {
+          console.warn(
+            '[ResoundAdapter] ⚠ Payload may be encrypted — trusted bond / AES session ' +
+            'may be required. See src/ble/gn/ for encryption support.',
+          );
+        }
+        break;
+    }
+  }
+
+  /**
+   * Log GN error opcode (0x08) tuples in plain English.
+   * Error format: [errorType, handle, errorCode, ...]
+   * From HandleBasedPlatform error handling.
+   */
+  private logGnError(payload: number[]): void {
+    const hex = (b: number) => '0x' + b.toString(16).padStart(2, '0');
+
+    if (payload.length < 3) {
+      console.warn(
+        '[ResoundAdapter] GN notify [0x08 Error] short payload:',
+        payload.map(hex).join(' '),
+      );
+      return;
+    }
+
+    const errType = payload[0];
+    const handle = payload[1];
+    const errCode = payload[2];
+
+    const errCodeNames: Record<number, string> = {
+      0x01: 'invalid handle',
+      0x02: 'read not permitted',
+      0x03: 'write not permitted',
+      0x06: 'request not supported',
+      0x0d: 'invalid attribute length',
+      0x0e: 'insufficient encryption',
+      0x10: 'insufficient resources',
+      0x81: 'not permitted (vendor)',
+      0x82: 'invalid state (vendor)',
+      0xfe: 'out of range',
+      0xff: 'procedure in progress',
+    };
+
+    const errName = errCodeNames[errCode] ?? `unknown (${hex(errCode)})`;
+    console.warn(
+      `[ResoundAdapter] GN notify [0x08 Error] type=${hex(errType)} ` +
+      `handle=${hex(handle)} error=${errName}`,
+    );
+
+    if (errCode === 0x0e) {
+      console.warn(
+        '[ResoundAdapter] ⚠ "Insufficient encryption" — device requires trusted bond. ' +
+        'Establish AES session via src/ble/gn/ encryption before retrying.',
+      );
+    }
+  }
+}
+
+// ── Notify helpers ──
+
+/**
+ * Heuristic: does a payload look encrypted (high byte entropy)?
+ * Returns true when the byte distribution looks random rather than structured.
+ */
+function looksEncrypted(data: number[]): boolean {
+  if (data.length < 8) return false;
+  // Count distinct byte values in the payload; structured GN payloads
+  // typically use a small set of values, encrypted data is broadly distributed
+  const distinct = new Set(data).size;
+  return distinct > data.length * 0.6 && data.length >= 12;
 }
 
 // ── Utility ──
