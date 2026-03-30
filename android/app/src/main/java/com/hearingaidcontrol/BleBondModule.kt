@@ -10,6 +10,7 @@ import android.content.IntentFilter
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import com.facebook.react.bridge.Arguments
 import com.facebook.react.bridge.Promise
 import com.facebook.react.bridge.ReactApplicationContext
 import com.facebook.react.bridge.ReactContextBaseJavaModule
@@ -26,6 +27,38 @@ class BleBondModule(private val reactContext: ReactApplicationContext)
     : ReactContextBaseJavaModule(reactContext) {
 
     override fun getName() = "BleBond"
+
+    /**
+     * All devices paired with Android that are BLE-capable (LE, dual-mode, or unknown type).
+     * Classic-only peripherals are omitted — they cannot be used with GATT / this app.
+     * Address format matches react-native-ble-plx (e.g. AA:BB:CC:DD:EE:FF).
+     */
+    @SuppressLint("MissingPermission")
+    @ReactMethod
+    fun getBondedBleDevices(promise: Promise) {
+        try {
+            val adapter = BluetoothAdapter.getDefaultAdapter()
+                ?: return promise.reject("BT_UNAVAILABLE", "Bluetooth not available")
+
+            val out = Arguments.createArray()
+            for (device in adapter.bondedDevices) {
+                if (device.bondState != BluetoothDevice.BOND_BONDED) continue
+
+                val type = device.type
+                // Skip BR/EDR-only — not addressable as BLE peripherals here
+                if (type == BluetoothDevice.DEVICE_TYPE_CLASSIC) continue
+
+                val row = Arguments.createMap()
+                row.putString("address", device.address?.uppercase())
+                row.putString("name", device.name)
+                row.putInt("deviceType", type)
+                out.pushMap(row)
+            }
+            promise.resolve(out)
+        } catch (e: Exception) {
+            promise.reject("BONDED_LIST_FAILED", e.message ?: "Unknown error")
+        }
+    }
 
     /** Returns the Android bond state integer: 10=NONE, 11=BONDING, 12=BONDED */
     @SuppressLint("MissingPermission")

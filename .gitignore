@@ -66,6 +66,10 @@ yarn-error.log
 # testing
 /coverage
 
+# Android bugreports (large; may contain sensitive device logs)
+bugreport*.zip
+_bugreport_extract/
+
 # Yarn
 .yarn/*
 !.yarn/patches

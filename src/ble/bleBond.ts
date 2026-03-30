@@ -14,6 +14,27 @@ import { NativeModules, Platform } from 'react-native';
 
 const { BleBond } = NativeModules;
 
+export type BondedBleRow = {
+  address: string;
+  name: string | null;
+  deviceType: number;
+};
+
+/**
+ * OS-paired BLE-capable devices (LE / dual / unknown). Classic-only omitted.
+ * Empty on iOS or if native module missing.
+ */
+export async function getBondedBleDevicesFromOs(): Promise<BondedBleRow[]> {
+  if (Platform.OS !== 'android' || !BleBond?.getBondedBleDevices) return [];
+  const rows = await BleBond.getBondedBleDevices();
+  if (!Array.isArray(rows)) return [];
+  return rows.map((r: { address?: string; name?: string | null; deviceType?: number }) => ({
+    address: String(r.address ?? ''),
+    name: r.name ?? null,
+    deviceType: typeof r.deviceType === 'number' ? r.deviceType : 0,
+  }));
+}
+
 export const BOND_NONE = 10;
 export const BOND_BONDING = 11;
 export const BOND_BONDED = 12;

@@ -38,7 +38,7 @@ export interface HearingAidAdapter {
 
   // Callbacks
   onRebootRequired?: (message: string) => void;
-  onAndroidBondingRequired?: (onUserReady: () => void) => void;
+  onAndroidBondingRequired?: () => void;
 
   // State
   refreshState(): Promise<DriverState>;
