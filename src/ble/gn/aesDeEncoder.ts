@@ -16,8 +16,8 @@
  *   decryptKey[16..31] = incoming counter seed
  *   After copy, counter bytes [12..15] are reset to [0,0,0,1].
  *
- * NOTE: react-native-quick-crypto must be installed for AES operations.
- * Run `npm install react-native-quick-crypto` if not already installed.
+ * NOTE: react-native-quick-crypto is used for AES via CBC mode.
+ * ECB mode is avoided because it produces wrong output on some devices.
  */
 
 // react-native-quick-crypto provides Node.js-compatible crypto API
@@ -119,18 +119,18 @@ export class AESDeEncoder {
 
 /**
  * AES-ECB encrypt a single 16-byte block.
- * Uses react-native-quick-crypto's createCipheriv with ECB mode.
+ *
+ * Uses AES-128-CBC with a zero IV instead of ECB because
+ * react-native-quick-crypto's ECB mode produces wrong output on some
+ * devices (verified by NIST test vector).  For a single 16-byte block,
+ * CBC with IV=0 is identical to ECB (the first block XORs with the
+ * all-zero IV, which is a no-op).
  */
 function aesEcbEncryptBlock(key: Uint8Array, block: Uint8Array): Uint8Array {
-  // ECB mode doesn't use an IV, pass empty buffer
-  const cipher = Crypto.createCipheriv(
-    'aes-128-ecb',
-    key,
-    null,
-  );
+  const zeroIV = new Uint8Array(16);
+  const cipher = Crypto.createCipheriv('aes-128-cbc', key, zeroIV);
   cipher.setAutoPadding(false);
   const encrypted = cipher.update(block);
-  cipher.final(); // ECB with exact block size produces no extra output
   return new Uint8Array(encrypted);
 }
 
@@ -202,16 +202,14 @@ export function selfTestAES(): void {
   const pt  = new Uint8Array([0x6b,0xc1,0xbe,0xe2,0x2e,0x40,0x9f,0x96,0xe9,0x3d,0x7e,0x11,0x73,0x93,0x17,0x2a]);
   const expected = '3ad77bb40d7a3660a89ecaf32466ef97';
 
-  // Use the internal aesEcbEncryptBlock function
-  const cipher = Crypto.createCipheriv('aes-128-ecb', key, null);
-  cipher.setAutoPadding(false);
-  const enc = cipher.update(pt);
-  const result = Array.from(new Uint8Array(enc)).map((b: number) => b.toString(16).padStart(2,'0')).join('');
+  // Use aesEcbEncryptBlock (now backed by AES-CBC with zero IV)
+  const enc = aesEcbEncryptBlock(key, pt);
+  const result = Array.from(enc).map((b: number) => b.toString(16).padStart(2,'0')).join('');
   const pass = result === expected;
   console.log('[AES SelfTest] Expected:', expected);
   console.log('[AES SelfTest] Got:     ', result);
   console.log('[AES SelfTest] PASS:', pass);
   if (!pass) {
-    console.error('[AES SelfTest] FAIL — react-native-quick-crypto AES-ECB is broken!');
+    console.error('[AES SelfTest] FAIL — AES-CBC(IV=0) workaround also broken!');
   }
 }
