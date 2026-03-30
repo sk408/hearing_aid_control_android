@@ -205,6 +205,11 @@ export class ResoundAdapter implements HearingAidAdapter {
   /** GN notify data handler — replaced temporarily during discover() */
   private onGnNotify: (data: number[]) => void = () => {};
 
+  /** Queue of notify responses that arrived before a waiter was registered */
+  private pendingNotifyQueue: number[][] = [];
+  /** Registered waiters for the next notify response */
+  private notifyWaiters: Array<(data: number[]) => void> = [];
+
   // ── Encryption state (Phase C) ──
 
   /** Current encoder: PassthroughDeEncoder (default) or AESDeEncoder (after bond) */
@@ -291,6 +296,8 @@ export class ResoundAdapter implements HearingAidAdapter {
       this.encoder = new PassthroughDeEncoder();
       this.bondInfo = createInitialBondInfo();
       this.trustKeyHandler = null;
+      this.pendingNotifyQueue = [];
+      this.notifyWaiters = [];
     }
   }
 
@@ -1047,6 +1054,14 @@ export class ResoundAdapter implements HearingAidAdapter {
             }
             this.parseGnNotify(data);
             this.onGnNotify(data);
+
+            // Feed any pending waiters (bond notify race condition fix)
+            const waiter = this.notifyWaiters.shift();
+            if (waiter) {
+              waiter(data);
+            } else {
+              this.pendingNotifyQueue.push(data);
+            }
           }
         },
       );
@@ -1226,6 +1241,8 @@ export class ResoundAdapter implements HearingAidAdapter {
 
     try {
       this.bondInfo = { ...createInitialBondInfo(), mode: 'reconnect', phase: 'reading_challenge' };
+      this.pendingNotifyQueue = [];
+      this.notifyWaiters = [];
       const gnSvc = this.resolveGnService();
 
       // Step 1: Read security capability
@@ -1280,6 +1297,10 @@ export class ResoundAdapter implements HearingAidAdapter {
       this.bondInfo.phase = 'writing_auth';
       const auth = handler.generateAuth(aesEncoder, BOND_TYPE_RECONNECT, stored.sharedAppIndex);
       const authB64 = bytesToBase64(Array.from(auth));
+
+      // Set up listener BEFORE writing (prevents race condition)
+      const responsePromise = this.awaitGnNotifyResponse(15000);
+
       await withRetry(() =>
         this.connected.writeCharacteristicWithResponseForService(
           gnSvc, GN_TRUSTED_APP_CHALLENGE_CHAR, authB64,
@@ -1288,7 +1309,7 @@ export class ResoundAdapter implements HearingAidAdapter {
 
       // Step 6: Await and verify response
       this.bondInfo.phase = 'awaiting_response';
-      const response = await this.awaitGnNotifyResponse(5000);
+      const response = await responsePromise;
       if (!response || response.length < 2) {
         throw new Error('No bond response from HI');
       }
@@ -1333,6 +1354,8 @@ export class ResoundAdapter implements HearingAidAdapter {
 
     try {
       this.bondInfo = { ...createInitialBondInfo(), mode: 'boot', phase: 'reading_challenge' };
+      this.pendingNotifyQueue = [];
+      this.notifyWaiters = [];
       const gnSvc = this.resolveGnService();
 
       // Read security capability
@@ -1382,6 +1405,10 @@ export class ResoundAdapter implements HearingAidAdapter {
       // Stage 1: GenerateAuth type 1
       this.bondInfo.phase = 'writing_auth';
       const auth1 = handler.generateAuth(aesEncoder, BOND_TYPE_BOOT_STAGE1, keyIndex);
+
+      // Set up listener BEFORE writing (prevents race condition)
+      const resp1Promise = this.awaitGnNotifyResponse(15000);
+
       await withRetry(() =>
         this.connected.writeCharacteristicWithResponseForService(
           gnSvc, GN_TRUSTED_APP_CHALLENGE_CHAR, bytesToBase64(Array.from(auth1)),
@@ -1390,7 +1417,7 @@ export class ResoundAdapter implements HearingAidAdapter {
 
       // Await response (may indicate reboot needed)
       this.bondInfo.phase = 'awaiting_response';
-      const resp1 = await this.awaitGnNotifyResponse(5000);
+      const resp1 = await resp1Promise;
       if (!resp1 || resp1.length < 2) {
         throw new Error('No stage 1 response');
       }
@@ -1400,13 +1427,17 @@ export class ResoundAdapter implements HearingAidAdapter {
 
       // Stage 2: GenerateAuth type 2
       const auth2 = handler.generateAuth(aesEncoder, BOND_TYPE_BOOT_STAGE2, keyIndex);
+
+      // Set up listener BEFORE writing (prevents race condition)
+      const resp2Promise = this.awaitGnNotifyResponse(15000);
+
       await withRetry(() =>
         this.connected.writeCharacteristicWithResponseForService(
           gnSvc, GN_TRUSTED_APP_CHALLENGE_CHAR, bytesToBase64(Array.from(auth2)),
         ),
       );
 
-      const resp2 = await this.awaitGnNotifyResponse(5000);
+      const resp2 = await resp2Promise;
       if (!resp2 || resp2.length < 2) {
         throw new Error('No stage 2 response');
       }
@@ -1456,6 +1487,8 @@ export class ResoundAdapter implements HearingAidAdapter {
 
     try {
       this.bondInfo = { ...createInitialBondInfo(), mode: 'passcode', phase: 'reading_challenge' };
+      this.pendingNotifyQueue = [];
+      this.notifyWaiters = [];
       const gnSvc = this.resolveGnService();
 
       // Read security capability
@@ -1506,6 +1539,10 @@ export class ResoundAdapter implements HearingAidAdapter {
       // Auth type 3
       this.bondInfo.phase = 'writing_auth';
       const auth = handler.generateAuth(aesEncoder, BOND_TYPE_PASSCODE, keyIndex);
+
+      // Set up listener BEFORE writing (prevents race condition)
+      const respPromise = this.awaitGnNotifyResponse(15000);
+
       await withRetry(() =>
         this.connected.writeCharacteristicWithResponseForService(
           gnSvc, GN_TRUSTED_APP_CHALLENGE_CHAR, bytesToBase64(Array.from(auth)),
@@ -1514,7 +1551,7 @@ export class ResoundAdapter implements HearingAidAdapter {
 
       // Verify response
       this.bondInfo.phase = 'awaiting_response';
-      const resp = await this.awaitGnNotifyResponse(5000);
+      const resp = await respPromise;
       if (!resp || resp.length < 2) throw new Error('No bond response');
 
       this.bondInfo.phase = 'verifying';
@@ -1553,26 +1590,31 @@ export class ResoundAdapter implements HearingAidAdapter {
 
   /**
    * Wait for a single GN notify response within a timeout.
+   * Uses a queue so the listener is registered BEFORE the write that triggers
+   * the response — prevents the race where the aid responds before we listen.
    * Returns the raw data or null if timed out.
    */
   private awaitGnNotifyResponse(timeoutMs: number): Promise<number[] | null> {
     return new Promise((resolve) => {
-      let settled = false;
-      const prevHandler = this.onGnNotify;
+      // Check if a response is already queued (arrived before we started waiting)
+      if (this.pendingNotifyQueue.length > 0) {
+        resolve(this.pendingNotifyQueue.shift()!);
+        return;
+      }
 
+      let settled = false;
       const finish = (data: number[] | null) => {
         if (settled) return;
         settled = true;
-        this.onGnNotify = prevHandler;
+        // Remove from waiters if still there
+        const idx = this.notifyWaiters.indexOf(resolver);
+        if (idx >= 0) this.notifyWaiters.splice(idx, 1);
         resolve(data);
       };
 
+      const resolver = (data: number[]) => finish(data);
+      this.notifyWaiters.push(resolver);
       setTimeout(() => finish(null), timeoutMs);
-
-      this.onGnNotify = (data: number[]) => {
-        prevHandler(data);
-        finish(data);
-      };
     });
   }
 }
