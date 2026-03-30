@@ -61,6 +61,27 @@ import type { Device } from 'react-native-ble-plx';
 import { getBleManager } from '../ble/BleManager';
 import type { HearingAidAdapter, DriverState } from './types';
 import type { DeviceInfo, Feature, Program } from '../ble/types';
+import { AESDeEncoder, PassthroughDeEncoder } from '../ble/gn/aesDeEncoder';
+import { P6TrustKeyHandler } from '../ble/gn/p6TrustKeyHandler';
+import {
+  GN_TRUSTED_APP_CHALLENGE_CHAR,
+  GN_HI_PUBLIC_KEY_CHAR,
+  AUTH_HI_SAYS_HI,
+  BOND_TYPE_BOOT_STAGE1,
+  BOND_TYPE_BOOT_STAGE2,
+  BOND_TYPE_PASSCODE,
+  BOND_TYPE_RECONNECT,
+} from '../ble/gn/gnConstants';
+import {
+  type GnBondInfo,
+  type StoredBondData,
+  createInitialBondInfo,
+  storeBondData,
+  loadBondData,
+  parseSecurityCap,
+  uint8ToBase64,
+  base64ToUint8,
+} from '../ble/gn/gnBondState';
 
 // ── ASHA service + volume (CONFIRMED — SPEC.md §2.4, command_dictionary.md) ──
 
@@ -70,7 +91,7 @@ const ASHA_VOLUME_CHAR = '00e4ca9e-ab14-41e4-8823-f9e70c7e91df';
 // ── GN services — FEFE (primary) → Palpatine P5 → e0262760 (newer stacks) ──
 
 const GN_FEFE_SERVICE = '0000fefe-0000-1000-8000-00805f9b34fb';
-const GN_PALPATINE_SERVICE = '4d56d4f5-0000-1000-8000-00805f9b34fb';
+const GN_PALPATINE_SERVICE = '4d56d4f5-af39-4885-9525-9f68c18ff451';
 const GN_SERVICE = 'e0262760-08c2-11e1-9073-0e8ac72ea010';
 const GN_COMMAND_CHAR = '1959a468-3234-4c18-9e78-8daf8d9dbf61';
 const GN_NOTIFY_CHAR = '8b51a2ca-5bed-418b-b54b-22fe666aadd2';
@@ -184,6 +205,15 @@ export class ResoundAdapter implements HearingAidAdapter {
   /** GN notify data handler — replaced temporarily during discover() */
   private onGnNotify: (data: number[]) => void = () => {};
 
+  // ── Encryption state (Phase C) ──
+
+  /** Current encoder: PassthroughDeEncoder (default) or AESDeEncoder (after bond) */
+  private encoder: PassthroughDeEncoder | AESDeEncoder = new PassthroughDeEncoder();
+  /** Bond state tracking */
+  private bondInfo: GnBondInfo = createInitialBondInfo();
+  /** Trust key handler — manages ECDH + SHA-256 derivation during bond */
+  private trustKeyHandler: P6TrustKeyHandler | null = null;
+
   private get connected(): Device {
     if (!this.device) {
       throw new Error('ResoundAdapter: not connected — call connect() first');
@@ -238,6 +268,9 @@ export class ResoundAdapter implements HearingAidAdapter {
       this.discoveredServices.clear();
       this.gnResolvedService = null;
       this.gnTrustBootstrapDone = false;
+      this.encoder = new PassthroughDeEncoder();
+      this.bondInfo = createInitialBondInfo();
+      this.trustKeyHandler = null;
     }
   }
 
@@ -906,25 +939,50 @@ export class ResoundAdapter implements HearingAidAdapter {
     }
   }
 
+  /**
+   * Write a GN command frame, encrypting when in a trusted session.
+   * From HandleBasedPlatform.SetData: encoder.Encrypt(fullFrame) when trusted.
+   */
   private async writeGnCommandFrame(frame: number[]): Promise<void> {
+    const cmdSvc = this.findService(GN_COMMAND_CHAR);
+    const dev = this.connected;
+
+    let payload: number[];
+    if (this.bondInfo.trusted && !(this.encoder instanceof PassthroughDeEncoder)) {
+      const encrypted = this.encoder.encrypt(new Uint8Array(frame));
+      payload = Array.from(encrypted);
+    } else {
+      payload = frame;
+    }
+
+    const b64 = bytesToBase64(payload);
+    try {
+      await withRetry(() =>
+        dev.writeCharacteristicWithResponseForService(cmdSvc, GN_COMMAND_CHAR, b64),
+      );
+    } catch {
+      await withRetry(() =>
+        dev.writeCharacteristicWithoutResponseForService(cmdSvc, GN_COMMAND_CHAR, b64),
+      );
+    }
+  }
+
+  /**
+   * Write raw bytes to GNCommand without encryption.
+   * From HandleBasedPlatform.WriteDataToCommandInterfaceNoEncryption.
+   * Use when encryption must be bypassed (e.g., initial discover in some states).
+   */
+  private async writeGnCommandFrameNoEncryption(frame: number[]): Promise<void> {
     const cmdSvc = this.findService(GN_COMMAND_CHAR);
     const b64 = bytesToBase64(frame);
     const dev = this.connected;
     try {
       await withRetry(() =>
-        dev.writeCharacteristicWithResponseForService(
-          cmdSvc,
-          GN_COMMAND_CHAR,
-          b64,
-        ),
+        dev.writeCharacteristicWithResponseForService(cmdSvc, GN_COMMAND_CHAR, b64),
       );
     } catch {
       await withRetry(() =>
-        dev.writeCharacteristicWithoutResponseForService(
-          cmdSvc,
-          GN_COMMAND_CHAR,
-          b64,
-        ),
+        dev.writeCharacteristicWithoutResponseForService(cmdSvc, GN_COMMAND_CHAR, b64),
       );
     }
   }
@@ -955,7 +1013,18 @@ export class ResoundAdapter implements HearingAidAdapter {
             return;
           }
           if (characteristic?.value) {
-            const data = base64ToBytes(characteristic.value);
+            const raw = base64ToBytes(characteristic.value);
+            // Notification handler: strip opcode (first byte), decrypt remainder if trusted
+            // From HandleBasedPlatform.Notification (non-DFU path)
+            let data: number[];
+            if (raw.length > 1 && this.bondInfo.trusted &&
+                !(this.encoder instanceof PassthroughDeEncoder)) {
+              const opcode = raw[0];
+              const decrypted = this.encoder.decrypt(new Uint8Array(raw.slice(1)));
+              data = [opcode, ...Array.from(decrypted)];
+            } else {
+              data = raw;
+            }
             this.parseGnNotify(data);
             this.onGnNotify(data);
           }
@@ -1075,6 +1144,445 @@ export class ResoundAdapter implements HearingAidAdapter {
       );
     }
   }
+
+  // ── Encryption integration (Phase C) ──
+
+  /**
+   * Write notification vector — 17-byte encrypted payload (0x01 + 16-byte bitfield).
+   * From HandleBasedPlatform.WriteNotificationVector: needed for subscriptions
+   * on handle-controlled characteristics.
+   */
+  async writeNotificationVector(bitfield: Uint8Array): Promise<void> {
+    if (bitfield.length !== 16) {
+      throw new Error('WriteNotificationVector: bitfield must be 16 bytes');
+    }
+    const vector = new Uint8Array(17);
+    vector[0] = 0x01;
+    vector.set(bitfield, 1);
+
+    const payload = this.bondInfo.trusted && !(this.encoder instanceof PassthroughDeEncoder)
+      ? this.encoder.encrypt(vector)
+      : vector;
+
+    const cmdSvc = this.findService(GN_COMMAND_CHAR);
+    const b64 = bytesToBase64(Array.from(payload));
+    try {
+      await withRetry(() =>
+        this.connected.writeCharacteristicWithResponseForService(
+          cmdSvc, GN_COMMAND_CHAR, b64,
+        ),
+      );
+    } catch {
+      await withRetry(() =>
+        this.connected.writeCharacteristicWithoutResponseForService(
+          cmdSvc, GN_COMMAND_CHAR, b64,
+        ),
+      );
+    }
+  }
+
+  /**
+   * Establish a trusted bond using stored SharedAppSecret (reconnect path).
+   *
+   * From HandleBasedPlatform.EstablishTrustedBond:
+   *   1. Read security capability → version, keyIndex
+   *   2. Read challenge from GNTrustedAppChallenge
+   *   3. Read HI public key from GNHIPublicKey
+   *   4. P6TrustKeyHandler: UpdateChallenge → SetHIPublicKey → SetSharedAppKey → GenerateKeys
+   *   5. GenerateAuth(type=4) → write to GNTrustedAppChallenge
+   *   6. Await GNNotify → decrypt → verify "HI says hi"
+   *
+   * @returns true if trusted bond established, false otherwise
+   */
+  async establishTrustedBond(): Promise<boolean> {
+    if (!this.deviceId) throw new Error('Not connected');
+
+    // Check for stored bond data
+    const stored = loadBondData(this.deviceId);
+    if (!stored) {
+      console.log('[ResoundAdapter] No stored bond data — cannot reconnect-bond');
+      return false;
+    }
+
+    try {
+      this.bondInfo = { ...createInitialBondInfo(), mode: 'reconnect', phase: 'reading_challenge' };
+      const gnSvc = this.resolveGnService();
+
+      // Step 1: Read security capability
+      const secCapKey = GN_SECURITY_CAP_CHAR.toLowerCase();
+      let version = 0;
+      let keyIndex = 0;
+      if (this.charServiceMap.has(secCapKey)) {
+        try {
+          const capChar = await withRetry(() =>
+            this.connected.readCharacteristicForService(gnSvc, GN_SECURITY_CAP_CHAR),
+          );
+          if (capChar.value) {
+            const capData = new Uint8Array(base64ToBytes(capChar.value));
+            const parsed = parseSecurityCap(capData);
+            version = parsed.version;
+            keyIndex = parsed.keyIndex;
+          }
+        } catch (e) {
+          console.warn('[ResoundAdapter] Security cap read failed:', e);
+        }
+      }
+      this.bondInfo.version = version;
+      this.bondInfo.keyIndex = keyIndex;
+
+      // Step 2: Read challenge
+      const challengeChar = await withRetry(() =>
+        this.connected.readCharacteristicForService(gnSvc, GN_TRUSTED_APP_CHALLENGE_CHAR),
+      );
+      if (!challengeChar.value) throw new Error('No challenge data');
+      const challenge = new Uint8Array(base64ToBytes(challengeChar.value));
+
+      // Step 3: Read HI public key
+      this.bondInfo.phase = 'reading_public_key';
+      const hiPubKeyChar = await withRetry(() =>
+        this.connected.readCharacteristicForService(gnSvc, GN_HI_PUBLIC_KEY_CHAR),
+      );
+      if (!hiPubKeyChar.value) throw new Error('No HI public key');
+      const hiPublicKey = new Uint8Array(base64ToBytes(hiPubKeyChar.value));
+
+      // Step 4: Key derivation
+      this.bondInfo.phase = 'generating_keys';
+      const handler = new P6TrustKeyHandler();
+      handler.updateChallenge(challenge, version, keyIndex);
+      handler.setHIPublicKey(hiPublicKey);
+      handler.setSharedAppKey(base64ToUint8(stored.sharedAppSecret));
+
+      const aesEncoder = new AESDeEncoder();
+      handler.generateKeys(aesEncoder);
+      this.trustKeyHandler = handler;
+
+      // Step 5: Generate and write auth
+      this.bondInfo.phase = 'writing_auth';
+      const auth = handler.generateAuth(aesEncoder, BOND_TYPE_RECONNECT, stored.sharedAppIndex);
+      const authB64 = bytesToBase64(Array.from(auth));
+      await withRetry(() =>
+        this.connected.writeCharacteristicWithResponseForService(
+          gnSvc, GN_TRUSTED_APP_CHALLENGE_CHAR, authB64,
+        ),
+      );
+
+      // Step 6: Await and verify response
+      this.bondInfo.phase = 'awaiting_response';
+      const response = await this.awaitGnNotifyResponse(5000);
+      if (!response || response.length < 2) {
+        throw new Error('No bond response from HI');
+      }
+
+      this.bondInfo.phase = 'verifying';
+      // Decrypt response payload (skip opcode byte)
+      const decrypted = aesEncoder.decrypt(new Uint8Array(response.slice(1)));
+      const responseText = utf8Decode(decrypted);
+
+      if (!responseText.includes(AUTH_HI_SAYS_HI)) {
+        console.warn('[ResoundAdapter] Bond verification failed — response:', responseText);
+        this.bondInfo.phase = 'failed';
+        return false;
+      }
+
+      // Success — switch to AES encoder
+      this.encoder = aesEncoder;
+      this.bondInfo.phase = 'trusted';
+      this.bondInfo.trusted = true;
+      console.log('[ResoundAdapter] Trusted bond established (reconnect)');
+      return true;
+
+    } catch (e) {
+      console.warn('[ResoundAdapter] EstablishTrustedBond failed:', e);
+      this.bondInfo.phase = 'failed';
+      return false;
+    }
+  }
+
+  /**
+   * Create a trusted bond using boot authentication (two-stage).
+   *
+   * From HandleBasedPlatform.CreateTrustedBondUsingBoot:
+   *   Stage 1: GenerateAuth(type=1) → may trigger HI reboot
+   *   Stage 2: GenerateAuth(type=2) → completes the bond
+   *   Persist SharedAppSecret + SharedAppIndex for future reconnect.
+   *
+   * @returns true if bond established
+   */
+  async createTrustedBondBoot(): Promise<boolean> {
+    if (!this.deviceId) throw new Error('Not connected');
+
+    try {
+      this.bondInfo = { ...createInitialBondInfo(), mode: 'boot', phase: 'reading_challenge' };
+      const gnSvc = this.resolveGnService();
+
+      // Read security capability
+      let version = 0;
+      let keyIndex = 0;
+      const secCapKey = GN_SECURITY_CAP_CHAR.toLowerCase();
+      if (this.charServiceMap.has(secCapKey)) {
+        try {
+          const capChar = await withRetry(() =>
+            this.connected.readCharacteristicForService(gnSvc, GN_SECURITY_CAP_CHAR),
+          );
+          if (capChar.value) {
+            const parsed = parseSecurityCap(new Uint8Array(base64ToBytes(capChar.value)));
+            version = parsed.version;
+            keyIndex = parsed.keyIndex;
+          }
+        } catch { /* continue with defaults */ }
+      }
+      this.bondInfo.version = version;
+      this.bondInfo.keyIndex = keyIndex;
+
+      // Read challenge
+      const challengeChar = await withRetry(() =>
+        this.connected.readCharacteristicForService(gnSvc, GN_TRUSTED_APP_CHALLENGE_CHAR),
+      );
+      if (!challengeChar.value) throw new Error('No challenge data');
+      const challenge = new Uint8Array(base64ToBytes(challengeChar.value));
+
+      // Read HI public key
+      this.bondInfo.phase = 'reading_public_key';
+      const hiPubKeyChar = await withRetry(() =>
+        this.connected.readCharacteristicForService(gnSvc, GN_HI_PUBLIC_KEY_CHAR),
+      );
+      if (!hiPubKeyChar.value) throw new Error('No HI public key');
+      const hiPublicKey = new Uint8Array(base64ToBytes(hiPubKeyChar.value));
+
+      // Key derivation
+      this.bondInfo.phase = 'generating_keys';
+      const handler = new P6TrustKeyHandler();
+      handler.updateChallenge(challenge, version, keyIndex);
+      handler.setHIPublicKey(hiPublicKey);
+
+      const aesEncoder = new AESDeEncoder();
+      handler.generateKeys(aesEncoder);
+      this.trustKeyHandler = handler;
+
+      // Stage 1: GenerateAuth type 1
+      this.bondInfo.phase = 'writing_auth';
+      const auth1 = handler.generateAuth(aesEncoder, BOND_TYPE_BOOT_STAGE1, keyIndex);
+      await withRetry(() =>
+        this.connected.writeCharacteristicWithResponseForService(
+          gnSvc, GN_TRUSTED_APP_CHALLENGE_CHAR, bytesToBase64(Array.from(auth1)),
+        ),
+      );
+
+      // Await response (may indicate reboot needed)
+      this.bondInfo.phase = 'awaiting_response';
+      const resp1 = await this.awaitGnNotifyResponse(5000);
+      if (!resp1 || resp1.length < 2) {
+        throw new Error('No stage 1 response');
+      }
+
+      // Check for reboot indicator — if HI reboots, we need to wait and reconnect.
+      // For now, proceed directly to stage 2 (works when reboot is not required).
+
+      // Stage 2: GenerateAuth type 2
+      const auth2 = handler.generateAuth(aesEncoder, BOND_TYPE_BOOT_STAGE2, keyIndex);
+      await withRetry(() =>
+        this.connected.writeCharacteristicWithResponseForService(
+          gnSvc, GN_TRUSTED_APP_CHALLENGE_CHAR, bytesToBase64(Array.from(auth2)),
+        ),
+      );
+
+      const resp2 = await this.awaitGnNotifyResponse(5000);
+      if (!resp2 || resp2.length < 2) {
+        throw new Error('No stage 2 response');
+      }
+
+      // Verify "HI says hi"
+      this.bondInfo.phase = 'verifying';
+      const decrypted = aesEncoder.decrypt(new Uint8Array(resp2.slice(1)));
+      const responseText = utf8Decode(decrypted);
+      if (!responseText.includes(AUTH_HI_SAYS_HI)) {
+        this.bondInfo.phase = 'failed';
+        return false;
+      }
+
+      // Success
+      this.encoder = aesEncoder;
+      this.bondInfo.phase = 'trusted';
+      this.bondInfo.trusted = true;
+
+      // Persist bond data for future reconnect
+      const sharedAppKey = handler.getSharedAppKey();
+      storeBondData({
+        deviceId: this.deviceId,
+        sharedAppSecret: uint8ToBase64(sharedAppKey),
+        sharedAppIndex: keyIndex,
+        lastBondTimestamp: Date.now(),
+      });
+
+      console.log('[ResoundAdapter] Trusted bond established (boot)');
+      return true;
+
+    } catch (e) {
+      console.warn('[ResoundAdapter] CreateTrustedBondBoot failed:', e);
+      this.bondInfo.phase = 'failed';
+      return false;
+    }
+  }
+
+  /**
+   * Create a trusted bond using a passcode.
+   *
+   * From HandleBasedPlatform.CreateTrustedBondUsingPasscode:
+   *   SetPasscode(GetHIID(challenge), passcode) before GenerateKeys.
+   *   GenerateAuth type 3.
+   */
+  async createTrustedBondPasscode(passcode: string): Promise<boolean> {
+    if (!this.deviceId) throw new Error('Not connected');
+
+    try {
+      this.bondInfo = { ...createInitialBondInfo(), mode: 'passcode', phase: 'reading_challenge' };
+      const gnSvc = this.resolveGnService();
+
+      // Read security capability
+      let version = 0;
+      let keyIndex = 0;
+      const secCapKey = GN_SECURITY_CAP_CHAR.toLowerCase();
+      if (this.charServiceMap.has(secCapKey)) {
+        try {
+          const capChar = await withRetry(() =>
+            this.connected.readCharacteristicForService(gnSvc, GN_SECURITY_CAP_CHAR),
+          );
+          if (capChar.value) {
+            const parsed = parseSecurityCap(new Uint8Array(base64ToBytes(capChar.value)));
+            version = parsed.version;
+            keyIndex = parsed.keyIndex;
+          }
+        } catch { /* continue */ }
+      }
+      this.bondInfo.version = version;
+      this.bondInfo.keyIndex = keyIndex;
+
+      // Read challenge
+      const challengeChar = await withRetry(() =>
+        this.connected.readCharacteristicForService(gnSvc, GN_TRUSTED_APP_CHALLENGE_CHAR),
+      );
+      if (!challengeChar.value) throw new Error('No challenge data');
+      const challenge = new Uint8Array(base64ToBytes(challengeChar.value));
+
+      // Read HI public key
+      this.bondInfo.phase = 'reading_public_key';
+      const hiPubKeyChar = await withRetry(() =>
+        this.connected.readCharacteristicForService(gnSvc, GN_HI_PUBLIC_KEY_CHAR),
+      );
+      if (!hiPubKeyChar.value) throw new Error('No HI public key');
+      const hiPublicKey = new Uint8Array(base64ToBytes(hiPubKeyChar.value));
+
+      // Key derivation with passcode
+      this.bondInfo.phase = 'generating_keys';
+      const handler = new P6TrustKeyHandler();
+      handler.updateChallenge(challenge, version, keyIndex);
+      handler.setHIPublicKey(hiPublicKey);
+      handler.setPasscode(P6TrustKeyHandler.getHIID(challenge), passcode);
+
+      const aesEncoder = new AESDeEncoder();
+      handler.generateKeys(aesEncoder);
+      this.trustKeyHandler = handler;
+
+      // Auth type 3
+      this.bondInfo.phase = 'writing_auth';
+      const auth = handler.generateAuth(aesEncoder, BOND_TYPE_PASSCODE, keyIndex);
+      await withRetry(() =>
+        this.connected.writeCharacteristicWithResponseForService(
+          gnSvc, GN_TRUSTED_APP_CHALLENGE_CHAR, bytesToBase64(Array.from(auth)),
+        ),
+      );
+
+      // Verify response
+      this.bondInfo.phase = 'awaiting_response';
+      const resp = await this.awaitGnNotifyResponse(5000);
+      if (!resp || resp.length < 2) throw new Error('No bond response');
+
+      this.bondInfo.phase = 'verifying';
+      const decrypted = aesEncoder.decrypt(new Uint8Array(resp.slice(1)));
+      const responseText = utf8Decode(decrypted);
+      if (!responseText.includes(AUTH_HI_SAYS_HI)) {
+        this.bondInfo.phase = 'failed';
+        return false;
+      }
+
+      this.encoder = aesEncoder;
+      this.bondInfo.phase = 'trusted';
+      this.bondInfo.trusted = true;
+
+      storeBondData({
+        deviceId: this.deviceId,
+        sharedAppSecret: uint8ToBase64(handler.getSharedAppKey()),
+        sharedAppIndex: keyIndex,
+        lastBondTimestamp: Date.now(),
+      });
+
+      console.log('[ResoundAdapter] Trusted bond established (passcode)');
+      return true;
+
+    } catch (e) {
+      console.warn('[ResoundAdapter] CreateTrustedBondPasscode failed:', e);
+      this.bondInfo.phase = 'failed';
+      return false;
+    }
+  }
+
+  /** Get current bond info (for UI/diagnostics) */
+  getBondInfo(): GnBondInfo {
+    return { ...this.bondInfo };
+  }
+
+  /**
+   * Wait for a single GN notify response within a timeout.
+   * Returns the raw data or null if timed out.
+   */
+  private awaitGnNotifyResponse(timeoutMs: number): Promise<number[] | null> {
+    return new Promise((resolve) => {
+      let settled = false;
+      const prevHandler = this.onGnNotify;
+
+      const finish = (data: number[] | null) => {
+        if (settled) return;
+        settled = true;
+        this.onGnNotify = prevHandler;
+        resolve(data);
+      };
+
+      setTimeout(() => finish(null), timeoutMs);
+
+      this.onGnNotify = (data: number[]) => {
+        prevHandler(data);
+        finish(data);
+      };
+    });
+  }
+}
+
+// ── Text helpers ──
+
+/** Decode UTF-8 bytes to string (manual — avoids TextDecoder dependency) */
+function utf8Decode(bytes: Uint8Array): string {
+  let result = '';
+  for (let i = 0; i < bytes.length; ) {
+    const b = bytes[i];
+    if (b < 0x80) {
+      result += String.fromCharCode(b);
+      i++;
+    } else if ((b & 0xe0) === 0xc0) {
+      result += String.fromCharCode(((b & 0x1f) << 6) | (bytes[i + 1] & 0x3f));
+      i += 2;
+    } else if ((b & 0xf0) === 0xe0) {
+      result += String.fromCharCode(
+        ((b & 0x0f) << 12) | ((bytes[i + 1] & 0x3f) << 6) | (bytes[i + 2] & 0x3f),
+      );
+      i += 3;
+    } else {
+      const cp = ((b & 0x07) << 18) | ((bytes[i + 1] & 0x3f) << 12) |
+        ((bytes[i + 2] & 0x3f) << 6) | (bytes[i + 3] & 0x3f);
+      result += String.fromCodePoint(cp);
+      i += 4;
+    }
+  }
+  return result;
 }
 
 // ── Notify helpers ──
