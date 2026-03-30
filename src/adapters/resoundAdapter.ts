@@ -62,7 +62,7 @@ import { getBleManager } from '../ble/BleManager';
 import { getBondState, createBond, BOND_BONDED } from '../ble/bleBond';
 import type { HearingAidAdapter, DriverState } from './types';
 import type { DeviceInfo, Feature, Program } from '../ble/types';
-import { AESDeEncoder, PassthroughDeEncoder } from '../ble/gn/aesDeEncoder';
+import { AESDeEncoder, PassthroughDeEncoder, selfTestAES } from '../ble/gn/aesDeEncoder';
 import { P6TrustKeyHandler } from '../ble/gn/p6TrustKeyHandler';
 import {
   GN_TRUSTED_APP_CHALLENGE_CHAR,
@@ -244,6 +244,7 @@ export class ResoundAdapter implements HearingAidAdapter {
   // ── Connection ──
 
   async connect(deviceId: string): Promise<void> {
+    selfTestAES();
     const manager = getBleManager();
     this.deviceId = deviceId;
 

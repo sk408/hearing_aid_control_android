@@ -192,3 +192,26 @@ export function getAppBaseKey(version: number, index: number): Uint8Array {
   }
   return keys[index];
 }
+
+export function selfTestAES(): void {
+  // NIST AES-128 ECB test vector
+  // Key: 2b7e151628aed2a6abf7158809cf4f3c
+  // Plaintext: 6bc1bee22e409f96e93d7e117393172a
+  // Expected: 3ad77bb40d7a3660a89ecaf32466ef97
+  const key = new Uint8Array([0x2b,0x7e,0x15,0x16,0x28,0xae,0xd2,0xa6,0xab,0xf7,0x15,0x88,0x09,0xcf,0x4f,0x3c]);
+  const pt  = new Uint8Array([0x6b,0xc1,0xbe,0xe2,0x2e,0x40,0x9f,0x96,0xe9,0x3d,0x7e,0x11,0x73,0x93,0x17,0x2a]);
+  const expected = '3ad77bb40d7a3660a89ecaf32466ef97';
+
+  // Use the internal aesEcbEncryptBlock function
+  const cipher = Crypto.createCipheriv('aes-128-ecb', key, null);
+  cipher.setAutoPadding(false);
+  const enc = cipher.update(pt);
+  const result = Array.from(new Uint8Array(enc)).map((b: number) => b.toString(16).padStart(2,'0')).join('');
+  const pass = result === expected;
+  console.log('[AES SelfTest] Expected:', expected);
+  console.log('[AES SelfTest] Got:     ', result);
+  console.log('[AES SelfTest] PASS:', pass);
+  if (!pass) {
+    console.error('[AES SelfTest] FAIL — react-native-quick-crypto AES-ECB is broken!');
+  }
+}
