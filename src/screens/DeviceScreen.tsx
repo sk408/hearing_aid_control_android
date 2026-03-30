@@ -111,6 +111,13 @@ export function DeviceScreen({ route }: DeviceScreenProps) {
       adapter.onRebootRequired = (message) => {
         Alert.alert('Reboot Required', message, [{ text: 'OK' }]);
       };
+      adapter.onAndroidBondingRequired = (onUserReady) => {
+        Alert.alert(
+          'Bluetooth Pairing Required',
+          'Accept the Bluetooth pairing request from Android when prompted, then tap Continue.',
+          [{ text: 'Continue', onPress: onUserReady }],
+        );
+      };
 
       logBleOp('adapter.connect', 'in progress...');
       await adapter.connect(device.id);
@@ -149,6 +156,13 @@ export function DeviceScreen({ route }: DeviceScreenProps) {
           if (!adapter) return;
           adapter.onRebootRequired = (message) => {
             Alert.alert('Reboot Required', message, [{ text: 'OK' }]);
+          };
+          adapter.onAndroidBondingRequired = (onUserReady) => {
+            Alert.alert(
+              'Bluetooth Pairing Required',
+              'Accept the Bluetooth pairing request from Android when prompted, then tap Continue.',
+              [{ text: 'Continue', onPress: onUserReady }],
+            );
           };
           logBleOp('adapter.connect', 'in progress...');
           await adapter.connect(device.id);

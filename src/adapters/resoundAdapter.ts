@@ -220,6 +220,7 @@ export class ResoundAdapter implements HearingAidAdapter {
   private trustKeyHandler: P6TrustKeyHandler | null = null;
 
   public onRebootRequired?: (message: string) => void;
+  public onAndroidBondingRequired?: (onUserReady: () => void) => void;
 
   private get connected(): Device {
     if (!this.device) {
@@ -241,26 +242,48 @@ export class ResoundAdapter implements HearingAidAdapter {
     await this.device.discoverAllServicesAndCharacteristics();
     await this.buildCharacteristicMap();
 
-    // Trigger Android bonding dialog by reading a secured ASHA characteristic.
-    // If the device is already bonded this is a no-op; if not, Android will
-    // prompt the user to pair.
+    // Step 1: Trigger Android BLE bond dialog
+    let androidBonded = false;
     try {
       await manager.readCharacteristicForDevice(
-        deviceId,
-        ASHA_SERVICE,
-        '6333651e-c481-4a3e-9169-7c902aad37bb',
+        deviceId, ASHA_SERVICE, '6333651e-c481-4a3e-9169-7c902aad37bb',
       );
-      console.log('[ResoundAdapter] Device bonded/trusted');
+      androidBonded = true;
+      console.log('[ResoundAdapter] Device already bonded/trusted');
     } catch (e) {
-      console.log('[ResoundAdapter] Bonding may be needed:', e);
+      console.log('[ResoundAdapter] Android bonding needed — waiting for user');
+    }
+
+    // Step 2: If not bonded, prompt user and wait for confirmation
+    if (!androidBonded && this.onAndroidBondingRequired) {
+      await new Promise<void>((resolve) => {
+        this.onAndroidBondingRequired!(() => resolve());
+      });
+      // Verify bond actually completed by retrying the secured read
+      for (let i = 0; i < 10; i++) {
+        await new Promise(r => setTimeout(r, 1500));
+        try {
+          await manager.readCharacteristicForDevice(
+            deviceId, ASHA_SERVICE, '6333651e-c481-4a3e-9169-7c902aad37bb',
+          );
+          androidBonded = true;
+          console.log('[ResoundAdapter] Android bond confirmed');
+          break;
+        } catch {
+          console.log(`[ResoundAdapter] Waiting for Android bond... (${i + 1}/10)`);
+        }
+      }
+      if (!androidBonded) {
+        console.warn('[ResoundAdapter] Android bond not confirmed — GN trust may fail');
+      }
+    } else if (!androidBonded) {
+      // No callback provided — just wait a few seconds and hope
+      await new Promise(r => setTimeout(r, 5000));
     }
 
     await this.setupGnNotify();
 
-    // Wait for Android BLE bond to complete before attempting GN trust
-    await new Promise(resolve => setTimeout(resolve, 2000)); // allow bond to settle
-
-    // GN application-level trust handshake (required for volume/program control)
+    // Step 3: GN application-level trust (only after Android bond is confirmed)
     try {
       const stored = loadBondData(this.deviceId);
       if (stored) {
