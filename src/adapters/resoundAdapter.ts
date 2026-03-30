@@ -249,6 +249,25 @@ export class ResoundAdapter implements HearingAidAdapter {
     }
 
     await this.setupGnNotify();
+
+    // GN application-level trust handshake (required for volume/program control)
+    try {
+      const stored = loadBondData(this.deviceId);
+      if (stored) {
+        // Reconnect path: use stored shared app secret
+        const bonded = await this.establishTrustedBond();
+        if (!bonded) {
+          console.log('[ResoundAdapter] Reconnect bond failed, trying boot bond...');
+          await this.createTrustedBondBoot();
+        }
+      } else {
+        // First time: full boot bond
+        console.log('[ResoundAdapter] No stored bond — starting boot bond...');
+        await this.createTrustedBondBoot();
+      }
+    } catch (e) {
+      console.warn('[ResoundAdapter] Trust handshake failed (will use plaintext):', e);
+    }
   }
 
   async disconnect(): Promise<void> {
