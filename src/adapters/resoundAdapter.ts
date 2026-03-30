@@ -116,6 +116,16 @@ const GN_SIDE_CHAR = '8d17ac2f-1d54-4742-a49a-ef4b20784eb3';
 const GN_ACTIVE_PROGRAM_CHAR = 'dc82f820-63ac-f82f-1e89-372fde4151f4';
 /** GN security capability — trust bootstrap per resound_phase2_static.md §5 */
 const GN_SECURITY_CAP_CHAR = '12257119-ddcb-4a12-9a08-1cd4df7921bb';
+
+/** GN bond notify: opcode 0x01, then auth status (AuthException.ThrowAuthExceptionOnCode). */
+const AUTH_STATUS_OK = 0;
+/** BLE.dll FAIL_HI_WAITS_FOR_REBOOT — only this code uses SetSharedAppKey after reboot. */
+const AUTH_HI_WAITS_FOR_REBOOT = 21; // 0x15
+/** Observed on some firmware before power-cycle; DLL maps to AuthNotAccepted — use full ECDH after reboot. */
+const AUTH_FW_REBOOT_HINT = 0x13;
+
+/** Bond ack status bytes that may appear before the 0x00 + ciphertext completion notify. */
+const BOND_ACK_INTERIM_STATUSES = new Set<number>([0x02]);
 /** Microphone / HA gain (not streaming-only ASHA volume) — handle 0x05 */
 const GN_MIC_ATTENUATION_CHAR = '32c9322d-6b17-11cf-0234-6f0da5eafd75';
 /** Streaming attenuation — handle 0x06, 0=mute 1..255 */
@@ -221,7 +231,7 @@ export class ResoundAdapter implements HearingAidAdapter {
   private trustKeyHandler: P6TrustKeyHandler | null = null;
 
   public onRebootRequired?: (message: string) => void;
-  public onAndroidBondingRequired?: (onUserReady: () => void) => void;
+  public onAndroidBondingRequired?: () => void;
 
   private get connected(): Device {
     if (!this.device) {
@@ -250,21 +260,12 @@ export class ResoundAdapter implements HearingAidAdapter {
     // must be called explicitly.  We use the native BleBond module for this.
     const bondState = await getBondState(deviceId);
     if (bondState !== BOND_BONDED) {
-      console.log('[ResoundAdapter] Android not bonded — calling createBond()...');
-      try {
-        await createBond(deviceId);
-        console.log('[ResoundAdapter] Android bond established');
-      } catch (e) {
-        console.warn('[ResoundAdapter] createBond() failed:', e);
-        // Fallback: let the UI tell the user to pair via Android Settings
-        if (this.onAndroidBondingRequired) {
-          await new Promise<void>((resolve) => {
-            this.onAndroidBondingRequired!(() => resolve());
-          });
-        }
-      }
+      console.log('[ResoundAdapter] Initiating Android BLE bond...');
+      this.onAndroidBondingRequired?.(); // inform UI that pairing dialog may appear
+      await createBond(deviceId); // waits up to 60s for BOND_BONDED, throws on reject
+      console.log('[ResoundAdapter] Android bond complete');
     } else {
-      console.log('[ResoundAdapter] Android already bonded');
+      console.log('[ResoundAdapter] Already Android-bonded');
     }
 
     await this.setupGnNotify();
@@ -288,10 +289,7 @@ export class ResoundAdapter implements HearingAidAdapter {
   }
 
   async disconnect(): Promise<void> {
-    if (this.notifySubscription) {
-      this.notifySubscription.remove();
-      this.notifySubscription = null;
-    }
+    this.teardownGnNotify();
     if (this.device) {
       try {
         await this.device.cancelConnection();
@@ -307,8 +305,6 @@ export class ResoundAdapter implements HearingAidAdapter {
       this.encoder = new PassthroughDeEncoder();
       this.bondInfo = createInitialBondInfo();
       this.trustKeyHandler = null;
-      this.pendingNotifyQueue = [];
-      this.notifyWaiters = [];
     }
   }
 
@@ -1026,8 +1022,26 @@ export class ResoundAdapter implements HearingAidAdapter {
   }
 
   /**
+   * Drop the active notify subscription and clear waiter queues.
+   * Required after GATT reconnect (e.g. HI reboot during boot bond): the old
+   * monitor is tied to the previous connection; keeping it blocks re-subscribe.
+   */
+  private teardownGnNotify(): void {
+    if (this.notifySubscription) {
+      try {
+        this.notifySubscription.remove();
+      } catch {
+        // Already torn down or connection dead
+      }
+      this.notifySubscription = null;
+    }
+    this.notifyWaiters = [];
+    this.pendingNotifyQueue = [];
+  }
+
+  /**
    * Subscribe to GN Notify for handle-based response data.
-   * Idempotent — will not double-subscribe.
+   * Safe to call again after reconnect — always tears down any prior monitor first.
    *
    * Opcodes (from HandleBasedPlatform.Notification switch):
    *   0x01 = Bond ack           0x05 = Blob data
@@ -1036,7 +1050,7 @@ export class ResoundAdapter implements HearingAidAdapter {
    *   0x04 = Notification payload 0x08 = Error
    */
   private async setupGnNotify(): Promise<void> {
-    if (this.notifySubscription) return;
+    this.teardownGnNotify();
 
     const dev = this.connected;
     const serviceUUID = this.findService(GN_NOTIFY_CHAR);
@@ -1326,9 +1340,12 @@ export class ResoundAdapter implements HearingAidAdapter {
       }
 
       this.bondInfo.phase = 'verifying';
-      // Decrypt response payload (skip opcode byte)
-      const decrypted = aesEncoder.decrypt(new Uint8Array(response.slice(1)));
-      const responseText = utf8Decode(decrypted);
+      this.assertNoFatalBondAuthStatus('EstablishTrustedBond', response, BOND_ACK_INTERIM_STATUSES);
+      if (response[0] !== 0x01 || response[1] !== AUTH_STATUS_OK || response.length < 3) {
+        throw new Error('Unexpected reconnect bond notify shape');
+      }
+      const decrypted = aesEncoder.decrypt(new Uint8Array(response.slice(2)));
+      const responseText = utf8Decode(decrypted.slice(1));
 
       if (!responseText.includes(AUTH_HI_SAYS_HI)) {
         console.warn('[ResoundAdapter] Bond verification failed — response:', responseText);
@@ -1351,6 +1368,255 @@ export class ResoundAdapter implements HearingAidAdapter {
   }
 
   /**
+   * Re-negotiate ATT MTU after reconnect. Boot auth writes are ~80+ bytes; at
+   * default MTU 23, write-with-response fails on Android until MTU is raised.
+   */
+  private async ensureNegotiatedMtu(requested: number = 512): Promise<void> {
+    try {
+      await withRetry(async () => {
+        const d = await this.connected.requestMTU(requested);
+        if (d.mtu < 64) {
+          console.warn('[ResoundAdapter] MTU still small after request:', d.mtu);
+        }
+      });
+    } catch (e) {
+      console.warn('[ResoundAdapter] MTU request failed:', e);
+    }
+  }
+
+  /**
+   * Write GNTrustedAppChallenge — try with response, then without (property / state dependent).
+   */
+  private async writeTrustedChallengeAuth(serviceUuid: string, auth: Uint8Array): Promise<void> {
+    const b64 = bytesToBase64(Array.from(auth));
+    const dev = this.connected;
+    try {
+      await withRetry(() =>
+        dev.writeCharacteristicWithResponseForService(serviceUuid, GN_TRUSTED_APP_CHALLENGE_CHAR, b64),
+      );
+      return;
+    } catch (e) {
+      console.warn('[ResoundAdapter] TrustedChallenge write with response failed, trying without:', e);
+    }
+    await withRetry(() =>
+      dev.writeCharacteristicWithoutResponseForService(serviceUuid, GN_TRUSTED_APP_CHALLENGE_CHAR, b64),
+    );
+  }
+
+  /**
+   * HandleBasedPlatform.ReadTrustConnectionParameters — write before security cap read.
+   */
+  private async gnSecurityCapPrimeWrite(gnSvc: string): Promise<void> {
+    const key = GN_SECURITY_CAP_CHAR.toLowerCase();
+    if (!this.charServiceMap.has(key)) return;
+    try {
+      await this.writeCharacteristicBothModes(gnSvc, GN_SECURITY_CAP_CHAR, [4, 0, 0, 0, 0]);
+    } catch {
+      // Best-effort; some stacks already primed
+    }
+  }
+
+  /**
+   * Bond notify 0x01 [status]: fail on non-OK status unless exempt (reboot hints).
+   */
+  private assertNoFatalBondAuthStatus(
+    context: string,
+    data: number[],
+    exempt: ReadonlySet<number>,
+  ): void {
+    if (data.length < 2 || data[0] !== 0x01) return;
+    const st = data[1];
+    if (st === AUTH_STATUS_OK || exempt.has(st)) return;
+    const label =
+      st === 13
+        ? 'Credentials rejected'
+        : st === 19
+          ? 'Auth not accepted'
+          : st === 2
+            ? 'Auth timeout'
+            : `Auth status ${st}`;
+    throw new Error(`${context}: ${label} (0x${st.toString(16)})`);
+  }
+
+  /**
+   * RespondeWithAuth: copy from index 2, decrypt, UTF-8 "HI says hi" at plaintext[1..],
+   * SharedAppIndex = plaintext[0] (HandleBasedPlatform ~746–760).
+   */
+  private parseBondAuthDecryptOk(aesEncoder: AESDeEncoder, data: number[]): { sharedAppIndex: number } | null {
+    if (data.length < 3 || data[0] !== 0x01 || data[1] !== AUTH_STATUS_OK) return null;
+    const cipher = data.slice(2);
+    if (cipher.length < 16) return null;
+    try {
+      const dec = aesEncoder.decrypt(new Uint8Array(cipher));
+      if (dec.length < 2) return null;
+      const text = utf8Decode(dec.slice(1));
+      if (text !== AUTH_HI_SAYS_HI && !text.includes(AUTH_HI_SAYS_HI)) return null;
+      return { sharedAppIndex: dec[0] };
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Boot bond stage 1 only (HandleBasedPlatform.CreateTrustedBondUsingBoot):
+   * security cap + challenge + HI public key + ECDH → GenerateKeys.
+   * Stage 2 after HI reboot uses {@link prepareBootBondStage2AfterReboot} instead
+   * (SetSharedAppKey from stage-1 SharedAppKey — no second SetHIPublicKey).
+   */
+  private async prepareBootBondMaterial(gnSvc: string): Promise<{
+    handler: P6TrustKeyHandler;
+    aesEncoder: AESDeEncoder;
+    keyIndex: number;
+  }> {
+    await this.gnSecurityCapPrimeWrite(gnSvc);
+
+    let version = 0;
+    let keyIndex = 0;
+    const secCapKey = GN_SECURITY_CAP_CHAR.toLowerCase();
+    if (this.charServiceMap.has(secCapKey)) {
+      try {
+        const capChar = await withRetry(() =>
+          this.connected.readCharacteristicForService(gnSvc, GN_SECURITY_CAP_CHAR),
+        );
+        if (capChar.value) {
+          const parsed = parseSecurityCap(new Uint8Array(base64ToBytes(capChar.value)));
+          version = parsed.version;
+          keyIndex = parsed.keyIndex;
+        }
+      } catch { /* defaults */ }
+    }
+    this.bondInfo.version = version;
+    this.bondInfo.keyIndex = keyIndex;
+
+    this.bondInfo.phase = 'reading_challenge';
+    const challengeChar = await withRetry(() =>
+      this.connected.readCharacteristicForService(gnSvc, GN_TRUSTED_APP_CHALLENGE_CHAR),
+    );
+    if (!challengeChar.value) throw new Error('No challenge data');
+    const challenge = new Uint8Array(base64ToBytes(challengeChar.value));
+
+    this.bondInfo.phase = 'reading_public_key';
+    const hiPubKeyChar = await withRetry(() =>
+      this.connected.readCharacteristicForService(gnSvc, GN_HI_PUBLIC_KEY_CHAR),
+    );
+    if (!hiPubKeyChar.value) throw new Error('No HI public key');
+    const hiPublicKey = new Uint8Array(base64ToBytes(hiPubKeyChar.value));
+
+    this.bondInfo.phase = 'generating_keys';
+    const handler = new P6TrustKeyHandler();
+    handler.updateChallenge(challenge, version, keyIndex);
+    handler.setHIPublicKey(hiPublicKey);
+    const aesEncoder = new AESDeEncoder();
+    handler.generateKeys(aesEncoder);
+    this.trustKeyHandler = handler;
+    return { handler, aesEncoder, keyIndex };
+  }
+
+  /**
+   * Boot stage 2 after HI reboot (HandleBasedPlatform lines 895–903):
+   * Discover + read challenge (≥36 bytes), new P6TrustKeyHandler, UpdateChallenge,
+   * SetSharedAppKey(stage1 SharedAppKey) — not SetHIPublicKey — then GenerateKeys.
+   * Stage-2 GenerateAuth therefore has no trailing app DH pubkey bytes (C# publicDHKey null).
+   */
+  private async prepareBootBondStage2AfterReboot(
+    gnSvc: string,
+    stage1SharedAppKey: Uint8Array,
+  ): Promise<{ handler: P6TrustKeyHandler; aesEncoder: AESDeEncoder; keyIndex: number }> {
+    await this.gnSecurityCapPrimeWrite(gnSvc);
+
+    let version = 0;
+    let keyIndex = 0;
+    const secCapKey = GN_SECURITY_CAP_CHAR.toLowerCase();
+    if (this.charServiceMap.has(secCapKey)) {
+      try {
+        const capChar = await withRetry(() =>
+          this.connected.readCharacteristicForService(gnSvc, GN_SECURITY_CAP_CHAR),
+        );
+        if (capChar.value) {
+          const parsed = parseSecurityCap(new Uint8Array(base64ToBytes(capChar.value)));
+          version = parsed.version;
+          keyIndex = parsed.keyIndex;
+        }
+      } catch { /* defaults */ }
+    }
+    this.bondInfo.version = version;
+    this.bondInfo.keyIndex = keyIndex;
+
+    this.bondInfo.phase = 'reading_challenge';
+    const challengeChar = await withRetry(() =>
+      this.connected.readCharacteristicForService(gnSvc, GN_TRUSTED_APP_CHALLENGE_CHAR),
+    );
+    if (!challengeChar.value) throw new Error('No challenge data after reboot');
+    const challenge = new Uint8Array(base64ToBytes(challengeChar.value));
+    if (challenge.length < 36) {
+      throw new Error(`Challenge too short after reboot (${challenge.length}), expected ≥36`);
+    }
+
+    this.bondInfo.phase = 'generating_keys';
+    const handler = new P6TrustKeyHandler();
+    handler.updateChallenge(challenge, version, keyIndex);
+    handler.setSharedAppKey(stage1SharedAppKey);
+    const aesEncoder = new AESDeEncoder();
+    handler.generateKeys(aesEncoder);
+    this.trustKeyHandler = handler;
+    return { handler, aesEncoder, keyIndex };
+  }
+
+  /**
+   * Boot verification notify: 0x01 uses ciphertext from byte 2 (RespondeWithAuth); 0x04 fallback strips opcode only.
+   */
+  private tryParseBootBondVerification(aesEncoder: AESDeEncoder, data: number[]): number | null {
+    if (data.length < 1) return null;
+    if (data[0] === 0x01) {
+      const r = this.parseBondAuthDecryptOk(aesEncoder, data);
+      return r ? r.sharedAppIndex : null;
+    }
+    if (data[0] === 0x04 && data.length >= 2) {
+      try {
+        const decrypted = aesEncoder.decrypt(new Uint8Array(data.slice(1)));
+        if (decrypted.length < 2) return null;
+        const text = utf8Decode(decrypted.slice(1));
+        if (!text.includes(AUTH_HI_SAYS_HI)) return null;
+        return decrypted[0];
+      } catch {
+        return null;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * After stage-2 write, accept bond ack (e.g. 0x01 0x02) then wait for verification notify.
+   * Returns SharedAppIndex from first decrypted byte (boot bond completion).
+   */
+  private async awaitBootBondVerification(
+    aesEncoder: AESDeEncoder,
+    firstPacket: number[] | null,
+    timeoutMs: number,
+  ): Promise<number> {
+    const deadline = Date.now() + timeoutMs;
+    let next: number[] | null = firstPacket;
+
+    while (Date.now() < deadline) {
+      if (next) {
+        this.assertNoFatalBondAuthStatus('Boot bond verify', next, BOND_ACK_INTERIM_STATUSES);
+        const idx = this.tryParseBootBondVerification(aesEncoder, next);
+        if (idx !== null) return idx;
+      }
+      const waitMs = Math.min(20000, Math.max(0, deadline - Date.now()));
+      if (waitMs <= 0) break;
+      next = await this.awaitGnNotifyResponse(waitMs);
+    }
+
+    if (next) {
+      this.assertNoFatalBondAuthStatus('Boot bond verify', next, BOND_ACK_INTERIM_STATUSES);
+      const idx = this.tryParseBootBondVerification(aesEncoder, next);
+      if (idx !== null) return idx;
+    }
+    throw new Error('Bond verification: "HI says hi" not found in GN notifies');
+  }
+
+  /**
    * Create a trusted bond using boot authentication (two-stage).
    *
    * From HandleBasedPlatform.CreateTrustedBondUsingBoot:
@@ -1362,6 +1628,7 @@ export class ResoundAdapter implements HearingAidAdapter {
    */
   async createTrustedBondBoot(): Promise<boolean> {
     if (!this.deviceId) throw new Error('Not connected');
+    console.log('[ResoundAdapter] Starting boot bond flow...');
 
     try {
       this.bondInfo = { ...createInitialBondInfo(), mode: 'boot', phase: 'reading_challenge' };
@@ -1369,62 +1636,18 @@ export class ResoundAdapter implements HearingAidAdapter {
       this.notifyWaiters = [];
       const gnSvc = this.resolveGnService();
 
-      // Read security capability
-      let version = 0;
-      let keyIndex = 0;
-      const secCapKey = GN_SECURITY_CAP_CHAR.toLowerCase();
-      if (this.charServiceMap.has(secCapKey)) {
-        try {
-          const capChar = await withRetry(() =>
-            this.connected.readCharacteristicForService(gnSvc, GN_SECURITY_CAP_CHAR),
-          );
-          if (capChar.value) {
-            const parsed = parseSecurityCap(new Uint8Array(base64ToBytes(capChar.value)));
-            version = parsed.version;
-            keyIndex = parsed.keyIndex;
-          }
-        } catch { /* continue with defaults */ }
-      }
-      this.bondInfo.version = version;
-      this.bondInfo.keyIndex = keyIndex;
+      let { handler, aesEncoder, keyIndex } = await this.prepareBootBondMaterial(gnSvc);
+      /** Stage-1 SharedAppKey — required for SetSharedAppKey after HI reboot (BLE.dll boot bond). */
+      let bootStage1SharedKey: Uint8Array | null = null;
 
-      // Read challenge
-      const challengeChar = await withRetry(() =>
-        this.connected.readCharacteristicForService(gnSvc, GN_TRUSTED_APP_CHALLENGE_CHAR),
-      );
-      if (!challengeChar.value) throw new Error('No challenge data');
-      const challenge = new Uint8Array(base64ToBytes(challengeChar.value));
-
-      // Read HI public key
-      this.bondInfo.phase = 'reading_public_key';
-      const hiPubKeyChar = await withRetry(() =>
-        this.connected.readCharacteristicForService(gnSvc, GN_HI_PUBLIC_KEY_CHAR),
-      );
-      if (!hiPubKeyChar.value) throw new Error('No HI public key');
-      const hiPublicKey = new Uint8Array(base64ToBytes(hiPubKeyChar.value));
-
-      // Key derivation
-      this.bondInfo.phase = 'generating_keys';
-      const handler = new P6TrustKeyHandler();
-      handler.updateChallenge(challenge, version, keyIndex);
-      handler.setHIPublicKey(hiPublicKey);
-
-      const aesEncoder = new AESDeEncoder();
-      handler.generateKeys(aesEncoder);
-      this.trustKeyHandler = handler;
-
-      // Stage 1: GenerateAuth type 1
+      // Stage 1: GenerateAuth type 1 — third byte is always 0 in CreateTrustedBondUsingBoot (C#)
       this.bondInfo.phase = 'writing_auth';
-      const auth1 = handler.generateAuth(aesEncoder, BOND_TYPE_BOOT_STAGE1, keyIndex);
+      const auth1 = handler.generateAuth(aesEncoder, BOND_TYPE_BOOT_STAGE1, 0);
 
       // Set up listener BEFORE writing (prevents race condition)
       const resp1Promise = this.awaitGnNotifyResponse(15000);
 
-      await withRetry(() =>
-        this.connected.writeCharacteristicWithResponseForService(
-          gnSvc, GN_TRUSTED_APP_CHALLENGE_CHAR, bytesToBase64(Array.from(auth1)),
-        ),
-      );
+      await this.writeTrustedChallengeAuth(gnSvc, auth1);
 
       // Await response (may indicate reboot needed)
       this.bondInfo.phase = 'awaiting_response';
@@ -1434,9 +1657,31 @@ export class ResoundAdapter implements HearingAidAdapter {
       }
       console.log('[ResoundAdapter] Stage 1 response:', resp1.map(b => '0x' + b.toString(16).padStart(2, '0')).join(' '));
 
-      // Check for reboot indicator (0x13 = HI will reboot)
+      /**
+       * 0x15 (21) = HIWaitsForReboot in BLE.dll → tbi.SharedAppSecret for SetSharedAppKey path.
+       * 0x13 (19) = AuthNotAccepted in DLL but some firmware reboots anyway → full ECDH after reconnect.
+       */
+      // Both 0x15 (HIWaitsForReboot) and 0x13 (AuthNotAccepted/reboot hint) use
+      // the SetSharedAppKey path after reconnect — confirmed by live device behavior.
+      const useSharedKeyAfterReboot = resp1[1] === AUTH_HI_WAITS_FOR_REBOOT || resp1[1] === AUTH_FW_REBOOT_HINT;
+      const useFullEcdhAfterReboot = false; // retired — 0x13 also uses SetSharedAppKey
+      const needRebootWait = useSharedKeyAfterReboot || useFullEcdhAfterReboot;
+
+      if (!needRebootWait) {
+        this.assertNoFatalBondAuthStatus('Boot stage 1', resp1, BOND_ACK_INTERIM_STATUSES);
+      }
+
       let gnSvc2 = gnSvc;
-      if (resp1[1] === 0x13) {
+      if (needRebootWait) {
+        if (useSharedKeyAfterReboot) {
+          bootStage1SharedKey = new Uint8Array(handler.getSharedAppKey());
+          console.log('[ResoundAdapter] Stage 1: HI waits for reboot (0x15) — SetSharedAppKey path after reconnect');
+        } else {
+          bootStage1SharedKey = null;
+          console.log(
+            '[ResoundAdapter] Stage 1: firmware reboot hint (0x13) — full ECDH after reconnect (not SetSharedAppKey)',
+          );
+        }
         try {
           this.onRebootRequired?.(
             'Please reboot your hearing aid now (open/close the battery door or place in charger) to complete pairing.',
@@ -1458,12 +1703,12 @@ export class ResoundAdapter implements HearingAidAdapter {
           }).catch(() => {}); // swallow any errors during disconnect
 
           // Small additional wait to let the device fully power cycle
-          await new Promise(r => setTimeout(r, 3000));
+          await new Promise<void>((r) => setTimeout(() => r(), 3000));
 
           // Wait for reconnect
           let reconnected = false;
           for (let i = 0; i < 30; i++) {
-            await new Promise(r => setTimeout(r, 2000));
+            await new Promise<void>((r) => setTimeout(() => r(), 2000));
             try {
               const connected = await manager.isDeviceConnected(this.deviceId!);
               if (connected) { reconnected = true; break; }
@@ -1474,44 +1719,87 @@ export class ResoundAdapter implements HearingAidAdapter {
           }
           if (!reconnected) throw new Error('HI did not reconnect after reboot');
 
-          // Re-establish services
-          this.device = await manager.connectToDevice(this.deviceId!, { requestMTU: 512 });
-          await this.device.discoverAllServicesAndCharacteristics();
+          // Re-establish services — Android may auto-reconnect if bonded
+          try {
+            const isConn = await manager.isDeviceConnected(this.deviceId!);
+            if (!isConn) {
+              this.device = await manager.connectToDevice(this.deviceId!, { requestMTU: 512 });
+            } else {
+              // Already reconnected by Android — get device reference
+              const devs = await manager.devices([this.deviceId!]);
+              this.device = devs[0] ?? null;
+              if (!this.device) {
+                this.device = await manager.connectToDevice(this.deviceId!, { requestMTU: 512 });
+              }
+            }
+          } catch {
+            this.device = await manager.connectToDevice(this.deviceId!, { requestMTU: 512 });
+          }
+          await this.device!.discoverAllServicesAndCharacteristics();
           await this.buildCharacteristicMap();
+          await this.ensureNegotiatedMtu();
           await this.setupGnNotify();
           gnSvc2 = this.resolveGnService();
           console.log('[ResoundAdapter] Reconnected after HI reboot');
+          if (bootStage1SharedKey) {
+            ({ handler, aesEncoder, keyIndex } = await this.prepareBootBondStage2AfterReboot(
+              gnSvc2,
+              bootStage1SharedKey,
+            ));
+            console.log('[ResoundAdapter] Boot stage 2: SetSharedAppKey path (BLE.dll)');
+          } else {
+            ({ handler, aesEncoder, keyIndex } = await this.prepareBootBondMaterial(gnSvc2));
+            console.log('[ResoundAdapter] Boot stage 2: full ECDH material after 0x13 reboot path');
+          }
+          await this.ensureNegotiatedMtu();
         } catch (rebootErr) {
           // If we get here due to BLE cancellation during disconnect,
           // check if device eventually reconnected
           console.log('[ResoundAdapter] Reboot phase error (may be normal):', rebootErr);
           // Wait a bit then try to reconnect anyway
-          await new Promise(r => setTimeout(r, 5000));
+          await new Promise<void>((r) => setTimeout(() => r(), 5000));
           try {
             const manager = getBleManager();
-            this.device = await manager.connectToDevice(this.deviceId!, { requestMTU: 512 });
-            await this.device.discoverAllServicesAndCharacteristics();
+            const isConn = await manager.isDeviceConnected(this.deviceId!).catch(() => false);
+            if (!isConn) {
+              this.device = await manager.connectToDevice(this.deviceId!, { requestMTU: 512 });
+            } else {
+              const devs = await manager.devices([this.deviceId!]);
+              this.device = devs[0] ?? null;
+              if (!this.device) {
+                this.device = await manager.connectToDevice(this.deviceId!, { requestMTU: 512 });
+              }
+            }
+            await this.device!.discoverAllServicesAndCharacteristics();
             await this.buildCharacteristicMap();
+            await this.ensureNegotiatedMtu();
             await this.setupGnNotify();
             gnSvc2 = this.resolveGnService();
             console.log('[ResoundAdapter] Reconnected after HI reboot (fallback path)');
+            if (bootStage1SharedKey) {
+              ({ handler, aesEncoder, keyIndex } = await this.prepareBootBondStage2AfterReboot(
+                gnSvc2,
+                bootStage1SharedKey,
+              ));
+              console.log('[ResoundAdapter] Boot stage 2: SetSharedAppKey path (BLE.dll)');
+            } else {
+              ({ handler, aesEncoder, keyIndex } = await this.prepareBootBondMaterial(gnSvc2));
+              console.log('[ResoundAdapter] Boot stage 2: full ECDH material after 0x13 reboot path');
+            }
+            await this.ensureNegotiatedMtu();
           } catch (reconnectErr) {
             throw new Error('HI did not reconnect after reboot: ' + reconnectErr);
           }
         }
       }
 
-      // Stage 2: GenerateAuth type 2
-      const auth2 = handler.generateAuth(aesEncoder, BOND_TYPE_BOOT_STAGE2, keyIndex);
+      // Stage 2: GenerateAuth type 2 — sharedAppIndex arg is 0 in C#; index comes from HI response
+      const auth2 = handler.generateAuth(aesEncoder, BOND_TYPE_BOOT_STAGE2, 0);
 
       // Set up listener BEFORE writing (prevents race condition)
       const resp2Promise = this.awaitGnNotifyResponse(15000);
 
-      await withRetry(() =>
-        this.connected.writeCharacteristicWithResponseForService(
-          gnSvc2, GN_TRUSTED_APP_CHALLENGE_CHAR, bytesToBase64(Array.from(auth2)),
-        ),
-      );
+      await this.writeTrustedChallengeAuth(gnSvc2, auth2);
 
       let resp2 = await resp2Promise;
       if (!resp2 || resp2.length < 2) {
@@ -1519,37 +1807,23 @@ export class ResoundAdapter implements HearingAidAdapter {
       }
       console.log('[ResoundAdapter] Stage 2 response:', resp2.map(b => '0x' + b.toString(16).padStart(2, '0')).join(' '));
 
-      // If stage 2 response is only a 2-byte ack, wait for the actual verification payload
-      if (resp2.length === 2) {
-        console.log('[ResoundAdapter] Stage 2 was ack-only, awaiting verification payload...');
-        const verifyResp = await this.awaitGnNotifyResponse(15000);
-        if (!verifyResp || verifyResp.length < 2) {
-          throw new Error('No verification payload after stage 2 ack');
-        }
-        console.log('[ResoundAdapter] Verification payload:', verifyResp.map(b => '0x' + b.toString(16).padStart(2, '0')).join(' '));
-        resp2 = verifyResp;
-      }
+      this.assertNoFatalBondAuthStatus('Boot stage 2', resp2, BOND_ACK_INTERIM_STATUSES);
 
-      // Verify "HI says hi"
+      // Ack-only 0x01 0x02 is normal; "HI says hi" may arrive in a follow-up 0x01/0x04 notify
       this.bondInfo.phase = 'verifying';
-      const decrypted = aesEncoder.decrypt(new Uint8Array(resp2.slice(1)));
-      const responseText = utf8Decode(decrypted);
-      if (!responseText.includes(AUTH_HI_SAYS_HI)) {
-        this.bondInfo.phase = 'failed';
-        return false;
-      }
+      const sharedAppIndexFromHi = await this.awaitBootBondVerification(aesEncoder, resp2, 45000);
 
       // Success
       this.encoder = aesEncoder;
       this.bondInfo.phase = 'trusted';
       this.bondInfo.trusted = true;
 
-      // Persist bond data for future reconnect
+      // Persist bond data for future reconnect (SharedAppIndex from HI — HandleBasedPlatform line 904)
       const sharedAppKey = handler.getSharedAppKey();
       storeBondData({
         deviceId: this.deviceId,
         sharedAppSecret: uint8ToBase64(sharedAppKey),
-        sharedAppIndex: keyIndex,
+        sharedAppIndex: sharedAppIndexFromHi,
         lastBondTimestamp: Date.now(),
       });
 
@@ -1626,7 +1900,7 @@ export class ResoundAdapter implements HearingAidAdapter {
 
       // Auth type 3
       this.bondInfo.phase = 'writing_auth';
-      const auth = handler.generateAuth(aesEncoder, BOND_TYPE_PASSCODE, keyIndex);
+      const auth = handler.generateAuth(aesEncoder, BOND_TYPE_PASSCODE, 0);
 
       // Set up listener BEFORE writing (prevents race condition)
       const respPromise = this.awaitGnNotifyResponse(15000);
@@ -1643,8 +1917,12 @@ export class ResoundAdapter implements HearingAidAdapter {
       if (!resp || resp.length < 2) throw new Error('No bond response');
 
       this.bondInfo.phase = 'verifying';
-      const decrypted = aesEncoder.decrypt(new Uint8Array(resp.slice(1)));
-      const responseText = utf8Decode(decrypted);
+      this.assertNoFatalBondAuthStatus('Passcode bond', resp, BOND_ACK_INTERIM_STATUSES);
+      if (resp[0] !== 0x01 || resp[1] !== AUTH_STATUS_OK || resp.length < 3) {
+        throw new Error('Unexpected passcode bond notify shape');
+      }
+      const decrypted = aesEncoder.decrypt(new Uint8Array(resp.slice(2)));
+      const responseText = utf8Decode(decrypted.slice(1));
       if (!responseText.includes(AUTH_HI_SAYS_HI)) {
         this.bondInfo.phase = 'failed';
         return false;
