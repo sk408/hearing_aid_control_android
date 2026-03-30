@@ -113,8 +113,8 @@ export function DeviceScreen({ route }: DeviceScreenProps) {
       };
       adapter.onAndroidBondingRequired = (onUserReady) => {
         Alert.alert(
-          'Bluetooth Pairing Required',
-          'Accept the Bluetooth pairing request from Android when prompted, then tap Continue.',
+          'Bluetooth Pairing Failed',
+          'Automatic pairing failed. Please open Android Settings → Bluetooth, pair this device manually, then tap Continue.',
           [{ text: 'Continue', onPress: onUserReady }],
         );
       };

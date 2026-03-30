@@ -59,6 +59,7 @@
  */
 import type { Device } from 'react-native-ble-plx';
 import { getBleManager } from '../ble/BleManager';
+import { getBondState, createBond, BOND_BONDED } from '../ble/bleBond';
 import type { HearingAidAdapter, DriverState } from './types';
 import type { DeviceInfo, Feature, Program } from '../ble/types';
 import { AESDeEncoder, PassthroughDeEncoder } from '../ble/gn/aesDeEncoder';
@@ -242,48 +243,33 @@ export class ResoundAdapter implements HearingAidAdapter {
     await this.device.discoverAllServicesAndCharacteristics();
     await this.buildCharacteristicMap();
 
-    // Step 1: Trigger Android BLE bond dialog
-    let androidBonded = false;
-    try {
-      await manager.readCharacteristicForDevice(
-        deviceId, ASHA_SERVICE, '6333651e-c481-4a3e-9169-7c902aad37bb',
-      );
-      androidBonded = true;
-      console.log('[ResoundAdapter] Device already bonded/trusted');
-    } catch (e) {
-      console.log('[ResoundAdapter] Android bonding needed — waiting for user');
-    }
-
-    // Step 2: If not bonded, prompt user and wait for confirmation
-    if (!androidBonded && this.onAndroidBondingRequired) {
-      await new Promise<void>((resolve) => {
-        this.onAndroidBondingRequired!(() => resolve());
-      });
-      // Verify bond actually completed by retrying the secured read
-      for (let i = 0; i < 10; i++) {
-        await new Promise(r => setTimeout(r, 1500));
-        try {
-          await manager.readCharacteristicForDevice(
-            deviceId, ASHA_SERVICE, '6333651e-c481-4a3e-9169-7c902aad37bb',
-          );
-          androidBonded = true;
-          console.log('[ResoundAdapter] Android bond confirmed');
-          break;
-        } catch {
-          console.log(`[ResoundAdapter] Waiting for Android bond... (${i + 1}/10)`);
+    // Step 1: Ensure Android-level BLE bond exists before GN trust.
+    //
+    // react-native-ble-plx has no bonding API.  On Android 6+, the OS no
+    // longer auto-initiates bonding from a GATT auth failure — createBond()
+    // must be called explicitly.  We use the native BleBond module for this.
+    const bondState = await getBondState(deviceId);
+    if (bondState !== BOND_BONDED) {
+      console.log('[ResoundAdapter] Android not bonded — calling createBond()...');
+      try {
+        await createBond(deviceId);
+        console.log('[ResoundAdapter] Android bond established');
+      } catch (e) {
+        console.warn('[ResoundAdapter] createBond() failed:', e);
+        // Fallback: let the UI tell the user to pair via Android Settings
+        if (this.onAndroidBondingRequired) {
+          await new Promise<void>((resolve) => {
+            this.onAndroidBondingRequired!(() => resolve());
+          });
         }
       }
-      if (!androidBonded) {
-        console.warn('[ResoundAdapter] Android bond not confirmed — GN trust may fail');
-      }
-    } else if (!androidBonded) {
-      // No callback provided — just wait a few seconds and hope
-      await new Promise(r => setTimeout(r, 5000));
+    } else {
+      console.log('[ResoundAdapter] Android already bonded');
     }
 
     await this.setupGnNotify();
 
-    // Step 3: GN application-level trust (only after Android bond is confirmed)
+    // Step 2: GN application-level trust (only after Android bond is confirmed)
     try {
       const stored = loadBondData(this.deviceId);
       if (stored) {
