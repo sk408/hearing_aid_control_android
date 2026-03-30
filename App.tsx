@@ -12,12 +12,14 @@ import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import { HomeScreen } from './src/screens/HomeScreen';
 import { DeviceScreen } from './src/screens/DeviceScreen';
 import { BleProbeScreen } from './src/screens/BleProbeScreen';
+import { DualControlScreen } from './src/screens/DualControlScreen';
 import type { DiscoveredDevice } from './src/ble/types';
 
 export type RootStackParamList = {
   Home: undefined;
   Device: { device: DiscoveredDevice };
   BleProbe: { deviceId: string };
+  DualControl: undefined;
 };
 
 const Stack = createStackNavigator<RootStackParamList>();
@@ -57,6 +59,11 @@ function App(): React.JSX.Element {
               name="BleProbe"
               component={BleProbeScreen}
               options={{ title: 'BLE Probe' }}
+            />
+            <Stack.Screen
+              name="DualControl"
+              component={DualControlScreen}
+              options={{ title: 'Controls' }}
             />
           </Stack.Navigator>
         </NavigationContainer>

@@ -1,9 +1,11 @@
 /**
  * DeviceScreen — connects to device, discovers GATT services, detects brand,
- * creates + connects adapter, then shows control panel or "not supported" message.
+ * creates + connects adapter, auto-detects ear side, and assigns to the
+ * left/right store slot. Then navigates to the dual control screen.
+ *
  * Includes a Diagnostics section for real-device BLE debugging.
  */
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
@@ -22,7 +24,8 @@ import { getBleManager } from '../ble/BleManager';
 import { detectBrandFromDiscovery } from '../brand/detection';
 import { createAdapter } from '../adapters/factory';
 import { useDeviceStore } from '../store/deviceStore';
-import { ControlPanel } from './ControlPanel';
+import type { EarSide } from '../store/deviceStore';
+import type { HearingAidAdapter } from '../adapters/types';
 
 type DeviceScreenProps = {
   route: RouteProp<{ Device: { device: DiscoveredDevice } }, 'Device'>;
@@ -36,29 +39,122 @@ const BRAND_LABELS: Record<string, string> = {
   unknown: 'Unknown Brand',
 };
 
+/** The MFi HAP / GN side characteristic — 0=left, 1=right */
+const SIDE_CHAR_UUID = '8d17ac2f-1d54-4742-a49a-ef4b20784eb3';
+
+const B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+function base64ToBytes(base64: string): number[] {
+  const clean = base64.replace(/=+$/, '');
+  const out: number[] = [];
+  let bits = 0;
+  let collected = 0;
+  for (const ch of clean) {
+    const val = B64.indexOf(ch);
+    if (val < 0) continue;
+    bits = (bits << 6) | val;
+    collected += 6;
+    if (collected >= 8) {
+      collected -= 8;
+      out.push((bits >> collected) & 0xff);
+    }
+  }
+  return out;
+}
+
 type ConnectionState =
   | { status: 'connecting' }
   | { status: 'discovering' }
-  | { status: 'identified'; brand: Brand }
+  | { status: 'detecting_side' }
+  | { status: 'pick_side' }
+  | { status: 'assigned'; side: EarSide; brand: Brand }
+  | { status: 'slot_full'; side: EarSide }
   | { status: 'unsupported' }
   | { status: 'error'; message: string };
+
+/**
+ * Try to read the ear side from the device via BLE characteristic.
+ * Returns 'left', 'right', or null if unreadable.
+ */
+async function readEarSide(
+  deviceId: string,
+  serviceUUIDs: string[],
+  charServiceMap: Map<string, string>,
+): Promise<'left' | 'right' | null> {
+  const manager = getBleManager();
+
+  // Try each service that might contain the side characteristic
+  const possibleServices = [
+    charServiceMap.get(SIDE_CHAR_UUID),
+    ...serviceUUIDs,
+  ].filter(Boolean) as string[];
+
+  for (const svcUuid of possibleServices) {
+    try {
+      const char = await manager.readCharacteristicForDevice(
+        deviceId,
+        svcUuid,
+        SIDE_CHAR_UUID,
+      );
+      if (char.value) {
+        const bytes = base64ToBytes(char.value);
+        if (bytes.length > 0) {
+          return bytes[0] === 0 ? 'left' : 'right';
+        }
+      }
+    } catch {
+      // This service doesn't have the side char, try next
+    }
+  }
+  return null;
+}
+
+/**
+ * Check if two MAC addresses share the first 3 bytes (same manufacturer pair).
+ */
+function isMacPrefixMatch(mac1: string, mac2: string): boolean {
+  const normalize = (m: string) => m.replace(/[:-]/g, '').toUpperCase().slice(0, 6);
+  return normalize(mac1) === normalize(mac2);
+}
 
 export function DeviceScreen({ route }: DeviceScreenProps) {
   const { device } = route.params;
   const navigation = useNavigation<StackNavigationProp<RootStackParamList>>();
   const updateDiscoveredDeviceBrand = useDeviceStore((s) => s.updateDiscoveredDeviceBrand);
-  const setAdapter = useDeviceStore((s) => s.setAdapter);
-  const setConnectedDevice = useDeviceStore((s) => s.setConnectedDevice);
-  const setDriverState = useDeviceStore((s) => s.setDriverState);
+  const setDeviceSlot = useDeviceStore((s) => s.setDeviceSlot);
   const setServiceUUIDs = useDeviceStore((s) => s.setServiceUUIDs);
   const logBleOp = useDeviceStore((s) => s.logBleOp);
   const serviceUUIDs = useDeviceStore((s) => s.serviceUUIDs);
   const lastBleOp = useDeviceStore((s) => s.lastBleOp);
+  const leftDevice = useDeviceStore((s) => s.leftDevice);
+  const rightDevice = useDeviceStore((s) => s.rightDevice);
 
-  const [state, setState] = useState<ConnectionState>(
-    device.brand !== 'unknown'
-      ? { status: 'identified', brand: device.brand }
-      : { status: 'connecting' },
+  const [state, setState] = useState<ConnectionState>({ status: 'connecting' });
+
+  // Keep references for cleanup
+  const adapterRef = useRef<HearingAidAdapter | null>(null);
+  const assignedRef = useRef(false);
+
+  const assignToSlot = useCallback(
+    (side: EarSide, adapter: HearingAidAdapter, brand: Brand, driverState: any) => {
+      // Check if slot is already occupied by a different device
+      const existing = side === 'left' ? leftDevice : rightDevice;
+      if (existing && existing.deviceId !== device.id) {
+        setState({ status: 'slot_full', side });
+        return false;
+      }
+
+      setDeviceSlot(side, {
+        deviceId: device.id,
+        deviceName: device.name,
+        brand,
+        adapter,
+        driverState,
+      });
+      assignedRef.current = true;
+      setState({ status: 'assigned', side, brand });
+      return true;
+    },
+    [device.id, device.name, leftDevice, rightDevice, setDeviceSlot],
   );
 
   const connectAndIdentify = useCallback(async () => {
@@ -75,47 +171,51 @@ export function DeviceScreen({ route }: DeviceScreenProps) {
       logBleOp('discoverServices', 'in progress...');
       const discovered = await connected.discoverAllServicesAndCharacteristics();
 
-      // Collect all service UUIDs
       const services = await discovered.services();
       const svcUuids = services.map((s) => s.uuid);
       setServiceUUIDs(svcUuids);
 
-      // Collect all characteristic UUIDs across all services
+      // Build a map from char UUID → service UUID for side reading
+      const charServiceMap = new Map<string, string>();
       const charUuids: string[] = [];
       for (const service of services) {
         const chars = await discovered.characteristicsForService(service.uuid);
         for (const c of chars) {
           charUuids.push(c.uuid);
+          charServiceMap.set(c.uuid, service.uuid);
         }
       }
 
       logBleOp('discoverServices', `OK — ${svcUuids.length} services, ${charUuids.length} chars`);
 
-      // Re-run brand detection with full GATT data
-      const brand = detectBrandFromDiscovery(svcUuids, charUuids);
+      // Brand detection
+      const brand = device.brand !== 'unknown'
+        ? device.brand
+        : detectBrandFromDiscovery(svcUuids, charUuids);
 
       if (brand === 'unknown') {
         setState({ status: 'unsupported' });
         return;
       }
 
-      // Update the store so the device list reflects the real brand
       updateDiscoveredDeviceBrand(device.id, brand);
 
-      // Create and connect the adapter
+      // Create and connect adapter
       const adapter = createAdapter(brand);
       if (!adapter) {
         setState({ status: 'unsupported' });
         return;
       }
+      adapterRef.current = adapter;
+
       adapter.onRebootRequired = (message) => {
         Alert.alert('Reboot Required', message, [{ text: 'OK' }]);
       };
-      adapter.onAndroidBondingRequired = (onUserReady) => {
+      adapter.onAndroidBondingRequired = () => {
         Alert.alert(
-          'Bluetooth Pairing Failed',
-          'Automatic pairing failed. Please open Android Settings → Bluetooth, pair this device manually, then tap Continue.',
-          [{ text: 'Continue', onPress: onUserReady }],
+          'Bluetooth Pairing',
+          'A Bluetooth pairing request may appear — please accept it to continue.',
+          [{ text: 'OK' }],
         );
       };
 
@@ -123,79 +223,113 @@ export function DeviceScreen({ route }: DeviceScreenProps) {
       await adapter.connect(device.id);
       logBleOp('adapter.connect', 'OK');
 
-      setAdapter(adapter);
-      setConnectedDevice(device.id);
-
       // Initial state read
+      let driverState = null;
       try {
         logBleOp('refreshState', 'in progress...');
-        const driverState = await adapter.refreshState();
-        setDriverState(driverState);
+        driverState = await adapter.refreshState();
         logBleOp('refreshState', 'OK');
       } catch (err) {
         const msg = err instanceof Error ? err.message : 'unknown';
         logBleOp('refreshState', `FAILED: ${msg}`);
       }
 
-      setState({ status: 'identified', brand });
+      // Auto-detect ear side
+      setState({ status: 'detecting_side' });
+      logBleOp('detectSide', 'reading side characteristic...');
+      const detectedSide = await readEarSide(device.id, svcUuids, charServiceMap);
+
+      if (detectedSide) {
+        logBleOp('detectSide', `detected: ${detectedSide}`);
+        const assigned = assignToSlot(detectedSide, adapter, brand, driverState);
+        if (assigned) {
+          // Auto-navigate to controls after a brief moment
+          setTimeout(() => {
+            navigation.replace('DualControl');
+          }, 800);
+        }
+      } else {
+        logBleOp('detectSide', 'could not detect — asking user');
+        // Try to infer from available slots
+        if (!leftDevice && rightDevice) {
+          // Only right is connected, assign to left
+          assignToSlot('left', adapter, brand, driverState);
+          setTimeout(() => navigation.replace('DualControl'), 800);
+        } else if (leftDevice && !rightDevice) {
+          // Only left is connected, assign to right
+          assignToSlot('right', adapter, brand, driverState);
+          setTimeout(() => navigation.replace('DualControl'), 800);
+        } else {
+          // Neither connected or both free — ask user
+          setState({ status: 'pick_side' });
+        }
+      }
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Connection failed';
       logBleOp('connect', `FAILED: ${message}`);
       setState({ status: 'error', message });
     }
-  }, [device.id, updateDiscoveredDeviceBrand, setAdapter, setConnectedDevice, setDriverState, setServiceUUIDs, logBleOp]);
+  }, [
+    device.id,
+    device.brand,
+    device.name,
+    updateDiscoveredDeviceBrand,
+    setDeviceSlot,
+    setServiceUUIDs,
+    logBleOp,
+    leftDevice,
+    rightDevice,
+    assignToSlot,
+    navigation,
+  ]);
 
   useEffect(() => {
-    if (device.brand === 'unknown') {
-      void connectAndIdentify();
-    } else {
-      // Brand already known — still need to create + connect adapter
-      void (async () => {
-        try {
-          const adapter = createAdapter(device.brand);
-          if (!adapter) return;
-          adapter.onRebootRequired = (message) => {
-            Alert.alert('Reboot Required', message, [{ text: 'OK' }]);
-          };
-          adapter.onAndroidBondingRequired = (onUserReady) => {
-            Alert.alert(
-              'Bluetooth Pairing Required',
-              'Accept the Bluetooth pairing request from Android when prompted, then tap Continue.',
-              [{ text: 'Continue', onPress: onUserReady }],
-            );
-          };
-          logBleOp('adapter.connect', 'in progress...');
-          await adapter.connect(device.id);
-          logBleOp('adapter.connect', 'OK');
-          setAdapter(adapter);
-          setConnectedDevice(device.id);
+    void connectAndIdentify();
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-          logBleOp('refreshState', 'in progress...');
-          const driverState = await adapter.refreshState();
-          setDriverState(driverState);
-          logBleOp('refreshState', 'OK');
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : 'unknown';
-          logBleOp('adapter.connect', `FAILED: ${msg}`);
-        }
-      })();
-    }
-  }, [device.brand, device.id, connectAndIdentify, setAdapter, setConnectedDevice, setDriverState, logBleOp]);
-
-  // Cleanup: disconnect adapter + BLE on unmount
+  // Cleanup on unmount — only disconnect if NOT assigned to a slot
   useEffect(() => {
     return () => {
-      const adapter = useDeviceStore.getState().adapter;
-      if (adapter) {
-        void adapter.disconnect().catch(() => {});
-        setAdapter(null);
-      } else {
-        void getBleManager().cancelDeviceConnection(device.id).catch(() => {});
+      if (!assignedRef.current) {
+        const adapter = adapterRef.current;
+        if (adapter) {
+          void adapter.disconnect().catch(() => {});
+        } else {
+          void getBleManager().cancelDeviceConnection(device.id).catch(() => {});
+        }
       }
-      setConnectedDevice(null);
-      setDriverState(null);
     };
-  }, [device.id, setAdapter, setConnectedDevice, setDriverState]);
+  }, [device.id]);
+
+  const handlePickSide = useCallback(
+    (side: EarSide) => {
+      const adapter = adapterRef.current;
+      if (!adapter) return;
+      const brand = device.brand !== 'unknown' ? device.brand : 'unknown';
+      assignToSlot(side, adapter, brand, null);
+      setTimeout(() => navigation.replace('DualControl'), 400);
+    },
+    [device.brand, assignToSlot, navigation],
+  );
+
+  const handleForceReplace = useCallback(
+    async (side: EarSide) => {
+      // Disconnect the existing device in that slot
+      const existing = side === 'left' ? leftDevice : rightDevice;
+      if (existing) {
+        try { await existing.adapter.disconnect(); } catch { /* ignore */ }
+        try { await getBleManager().cancelDeviceConnection(existing.deviceId); } catch { /* ignore */ }
+        setDeviceSlot(side, null);
+      }
+      // Now assign the new device
+      const adapter = adapterRef.current;
+      if (!adapter) return;
+      const brand = device.brand !== 'unknown' ? device.brand : 'unknown';
+      assignToSlot(side, adapter, brand, null);
+      setTimeout(() => navigation.replace('DualControl'), 400);
+    },
+    [device.brand, leftDevice, rightDevice, setDeviceSlot, assignToSlot, navigation],
+  );
 
   const [diagExpanded, setDiagExpanded] = useState(false);
 
@@ -203,11 +337,6 @@ export function DeviceScreen({ route }: DeviceScreenProps) {
     <ScrollView style={styles.container}>
       <View style={styles.infoCard}>
         <Text style={styles.deviceName}>{device.name ?? 'Unknown Device'}</Text>
-        <Text style={styles.brand}>
-          {state.status === 'identified'
-            ? BRAND_LABELS[state.brand] ?? state.brand
-            : 'Identifying device...'}
-        </Text>
         <Text style={styles.id}>{device.id}</Text>
         {device.rssi != null && (
           <Text style={styles.rssi}>Signal: {device.rssi} dBm</Text>
@@ -228,16 +357,75 @@ export function DeviceScreen({ route }: DeviceScreenProps) {
         </View>
       )}
 
-      {state.status === 'identified' && <ControlPanel brand={state.brand} />}
+      {state.status === 'detecting_side' && (
+        <View style={styles.statusContainer}>
+          <ActivityIndicator size="large" color="#0066CC" />
+          <Text style={styles.statusText}>Detecting ear side...</Text>
+        </View>
+      )}
 
-      {state.status === 'identified' && (
-        <TouchableOpacity
-          style={styles.probeBtn}
-          onPress={() => navigation.navigate('BleProbe', { deviceId: device.id })}
-          activeOpacity={0.7}
-        >
-          <Text style={styles.probeBtnText}>Probe</Text>
-        </TouchableOpacity>
+      {state.status === 'pick_side' && (
+        <View style={styles.pickSideCard}>
+          <Text style={styles.pickSideTitle}>Which ear is this device?</Text>
+          <Text style={styles.pickSideBody}>
+            Could not auto-detect the side. Please select:
+          </Text>
+          <View style={styles.pickSideRow}>
+            <TouchableOpacity
+              style={[styles.sideButton, styles.sideButtonLeft]}
+              onPress={() => handlePickSide('left')}
+              activeOpacity={0.7}>
+              <Text style={styles.sideButtonText}>Left Ear</Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[styles.sideButton, styles.sideButtonRight]}
+              onPress={() => handlePickSide('right')}
+              activeOpacity={0.7}>
+              <Text style={styles.sideButtonText}>Right Ear</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      )}
+
+      {state.status === 'slot_full' && (
+        <View style={styles.pickSideCard}>
+          <Text style={styles.pickSideTitle}>
+            {state.side === 'left' ? 'Left' : 'Right'} slot already connected
+          </Text>
+          <Text style={styles.pickSideBody}>
+            Replace the existing device or assign to the other ear?
+          </Text>
+          <View style={styles.pickSideRow}>
+            <TouchableOpacity
+              style={[styles.sideButton, { backgroundColor: '#CC6600' }]}
+              onPress={() => handleForceReplace(state.side)}
+              activeOpacity={0.7}>
+              <Text style={styles.sideButtonText}>
+                Replace {state.side === 'left' ? 'Left' : 'Right'}
+              </Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[styles.sideButton, { backgroundColor: '#0066CC' }]}
+              onPress={() => handlePickSide(state.side === 'left' ? 'right' : 'left')}
+              activeOpacity={0.7}>
+              <Text style={styles.sideButtonText}>
+                Use {state.side === 'left' ? 'Right' : 'Left'} Ear
+              </Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      )}
+
+      {state.status === 'assigned' && (
+        <View style={styles.assignedCard}>
+          <Text style={styles.assignedTitle}>
+            Assigned to {state.side === 'left' ? 'Left' : 'Right'} Ear
+          </Text>
+          <Text style={styles.assignedBody}>
+            {BRAND_LABELS[state.brand] ?? state.brand}
+          </Text>
+          <Text style={styles.assignedHint}>Opening controls...</Text>
+        </View>
       )}
 
       {state.status === 'unsupported' && (
@@ -261,8 +449,7 @@ export function DeviceScreen({ route }: DeviceScreenProps) {
       <TouchableOpacity
         style={styles.diagHeader}
         onPress={() => setDiagExpanded((v) => !v)}
-        activeOpacity={0.7}
-      >
+        activeOpacity={0.7}>
         <Text style={styles.diagHeaderText}>
           Diagnostics {diagExpanded ? '[-]' : '[+]'}
         </Text>
@@ -321,12 +508,6 @@ const styles = StyleSheet.create({
     color: '#1A1A1A',
     marginBottom: 4,
   },
-  brand: {
-    fontSize: 14,
-    color: '#0066CC',
-    fontWeight: '600',
-    marginBottom: 8,
-  },
   id: {
     fontSize: 11,
     color: '#999',
@@ -347,6 +528,76 @@ const styles = StyleSheet.create({
     fontSize: 15,
     marginTop: 12,
     fontWeight: '500',
+  },
+  pickSideCard: {
+    backgroundColor: '#FFF',
+    borderRadius: 10,
+    padding: 20,
+    marginBottom: 16,
+    elevation: 2,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.1,
+    shadowRadius: 3,
+  },
+  pickSideTitle: {
+    fontSize: 17,
+    fontWeight: '700',
+    color: '#1A1A1A',
+    marginBottom: 8,
+    textAlign: 'center',
+  },
+  pickSideBody: {
+    fontSize: 14,
+    color: '#666',
+    textAlign: 'center',
+    marginBottom: 16,
+  },
+  pickSideRow: {
+    flexDirection: 'row',
+    gap: 12,
+  },
+  sideButton: {
+    flex: 1,
+    paddingVertical: 14,
+    borderRadius: 10,
+    alignItems: 'center',
+  },
+  sideButtonLeft: {
+    backgroundColor: '#0066CC',
+  },
+  sideButtonRight: {
+    backgroundColor: '#CC6600',
+  },
+  sideButtonText: {
+    color: '#FFF',
+    fontSize: 16,
+    fontWeight: '600',
+  },
+  assignedCard: {
+    backgroundColor: '#F0FFF0',
+    borderRadius: 10,
+    padding: 20,
+    marginBottom: 16,
+    borderWidth: 1,
+    borderColor: '#228B22',
+    alignItems: 'center',
+  },
+  assignedTitle: {
+    fontSize: 17,
+    fontWeight: '700',
+    color: '#228B22',
+    marginBottom: 4,
+  },
+  assignedBody: {
+    fontSize: 14,
+    color: '#333',
+  },
+  assignedHint: {
+    fontSize: 12,
+    color: '#999',
+    fontStyle: 'italic',
+    marginTop: 8,
   },
   unsupportedCard: {
     backgroundColor: '#FFF',
@@ -386,18 +637,6 @@ const styles = StyleSheet.create({
     fontSize: 14,
     color: '#666',
     textAlign: 'center',
-  },
-  probeBtn: {
-    backgroundColor: '#6A1B9A',
-    paddingVertical: 12,
-    borderRadius: 8,
-    alignItems: 'center',
-    marginBottom: 8,
-  },
-  probeBtnText: {
-    fontSize: 15,
-    fontWeight: '700',
-    color: '#FFF',
   },
   diagHeader: {
     marginTop: 16,

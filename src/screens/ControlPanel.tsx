@@ -1,6 +1,8 @@
 /**
- * ControlPanel — volume, program, mute controls wired to the BLE adapter.
- * Visual feedback: spinner while writing, checkmark on success, error on failure.
+ * ControlPanel — dual hearing aid control panel with linked/unlinked modes.
+ * When linked: single volume slider controls both aids.
+ * When unlinked: separate sliders for left and right.
+ * Programs always sync both. Battery shown per device.
  */
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
@@ -12,12 +14,10 @@ import {
   View,
 } from 'react-native';
 import Slider from '@react-native-community/slider';
-import type { Brand, Program } from '../ble/types';
+import type { Program } from '../ble/types';
 import { useDeviceStore } from '../store/deviceStore';
-
-interface ControlPanelProps {
-  brand: Brand;
-}
+import type { DeviceSlot } from '../store/deviceStore';
+import type { HearingAidAdapter, DriverState } from '../adapters/types';
 
 /** Feedback state for a single control */
 type FeedbackState = 'idle' | 'busy' | 'ok' | 'error';
@@ -111,17 +111,42 @@ function useAdapterCall() {
   );
 }
 
-export function ControlPanel({ brand }: ControlPanelProps) {
-  const adapter = useDeviceStore((s) => s.adapter);
-  const driverState = useDeviceStore((s) => s.driverState);
-  const setDriverState = useDeviceStore((s) => s.setDriverState);
+/** Run an operation on one or both adapters */
+async function runOnAdapters(
+  adapters: HearingAidAdapter[],
+  fn: (adapter: HearingAidAdapter) => Promise<void>,
+): Promise<void> {
+  await Promise.all(adapters.map(fn));
+}
+
+export function ControlPanel() {
+  const leftDevice = useDeviceStore((s) => s.leftDevice);
+  const rightDevice = useDeviceStore((s) => s.rightDevice);
+  const linked = useDeviceStore((s) => s.linked);
+  const setLinked = useDeviceStore((s) => s.setLinked);
+  const updateDriverState = useDeviceStore((s) => s.updateDriverState);
   const logBleOp = useDeviceStore((s) => s.logBleOp);
   const runCall = useAdapterCall();
 
-  // Local UI state — initialized from driver state when available
-  const [volume, setVolume] = useState(driverState?.volume ?? 50);
-  const [muted, setMuted] = useState(driverState?.muted ?? false);
-  const [program, setProgram] = useState(driverState?.activeProgram ?? 0);
+  // Derive adapters
+  const leftAdapter = leftDevice?.adapter ?? null;
+  const rightAdapter = rightDevice?.adapter ?? null;
+  const bothAdapters = [leftAdapter, rightAdapter].filter(Boolean) as HearingAidAdapter[];
+  const hasAny = bothAdapters.length > 0;
+  const hasBoth = leftAdapter != null && rightAdapter != null;
+
+  // Local UI state
+  const [volume, setVolume] = useState(
+    leftDevice?.driverState?.volume ?? rightDevice?.driverState?.volume ?? 50,
+  );
+  const [leftVolume, setLeftVolume] = useState(leftDevice?.driverState?.volume ?? 50);
+  const [rightVolume, setRightVolume] = useState(rightDevice?.driverState?.volume ?? 50);
+  const [muted, setMuted] = useState(
+    leftDevice?.driverState?.muted ?? rightDevice?.driverState?.muted ?? false,
+  );
+  const [program, setProgram] = useState(
+    leftDevice?.driverState?.activeProgram ?? rightDevice?.driverState?.activeProgram ?? 0,
+  );
   const [programs, setPrograms] = useState<Program[]>([
     { index: 0, name: 'Program 1' },
     { index: 1, name: 'Program 2' },
@@ -131,65 +156,124 @@ export function ControlPanel({ brand }: ControlPanelProps) {
 
   // Feedback per control
   const [volumeFb, setVolumeFb] = useState<ControlFeedback>({ state: 'idle' });
+  const [leftVolumeFb, setLeftVolumeFb] = useState<ControlFeedback>({ state: 'idle' });
+  const [rightVolumeFb, setRightVolumeFb] = useState<ControlFeedback>({ state: 'idle' });
   const [muteFb, setMuteFb] = useState<ControlFeedback>({ state: 'idle' });
   const [programFb, setProgramFb] = useState<ControlFeedback>({ state: 'idle' });
   const [refreshFb, setRefreshFb] = useState<ControlFeedback>({ state: 'idle' });
 
   // Sync local state when driver state updates
-  const prevDriverState = useRef(driverState);
-  useEffect(() => {
-    if (driverState && driverState !== prevDriverState.current) {
-      if (driverState.volume !== undefined) setVolume(driverState.volume);
-      if (driverState.muted !== undefined) setMuted(driverState.muted);
-      if (driverState.activeProgram !== undefined) setProgram(driverState.activeProgram);
-    }
-    prevDriverState.current = driverState;
-  }, [driverState]);
+  const prevLeft = useRef(leftDevice?.driverState);
+  const prevRight = useRef(rightDevice?.driverState);
 
-  // Load programs from adapter on mount
   useEffect(() => {
+    const ld = leftDevice?.driverState;
+    if (ld && ld !== prevLeft.current) {
+      if (ld.volume !== undefined) {
+        setLeftVolume(ld.volume);
+        if (linked) setVolume(ld.volume);
+      }
+      if (ld.muted !== undefined) setMuted(ld.muted);
+      if (ld.activeProgram !== undefined) setProgram(ld.activeProgram);
+    }
+    prevLeft.current = ld;
+  }, [leftDevice?.driverState, linked]);
+
+  useEffect(() => {
+    const rd = rightDevice?.driverState;
+    if (rd && rd !== prevRight.current) {
+      if (rd.volume !== undefined) {
+        setRightVolume(rd.volume);
+        if (linked && !leftDevice) setVolume(rd.volume);
+      }
+      if (rd.muted !== undefined && !leftDevice) setMuted(rd.muted);
+      if (rd.activeProgram !== undefined && !leftDevice) setProgram(rd.activeProgram);
+    }
+    prevRight.current = rd;
+  }, [rightDevice?.driverState, linked, leftDevice]);
+
+  // Load programs from first available adapter
+  useEffect(() => {
+    const adapter = leftAdapter ?? rightAdapter;
     if (!adapter) return;
     void adapter.getPrograms().then(setPrograms).catch(() => {});
-  }, [adapter]);
+  }, [leftAdapter, rightAdapter]);
 
   // ── Handlers ──
 
-  const handleVolumeChangeEnd = useCallback(
+  const handleLinkedVolumeEnd = useCallback(
     (value: number) => {
       const rounded = Math.round(value);
       setVolume(rounded);
-      if (!adapter) return;
-      void runCall('setVolume', setVolumeFb, () => adapter.setVolume(rounded));
+      if (!hasAny) return;
+      void runCall('setVolume (both)', setVolumeFb, () =>
+        runOnAdapters(bothAdapters, (a) => a.setVolume(rounded)),
+      );
     },
-    [adapter, runCall],
+    [hasAny, bothAdapters, runCall],
+  );
+
+  const handleLeftVolumeEnd = useCallback(
+    (value: number) => {
+      const rounded = Math.round(value);
+      setLeftVolume(rounded);
+      if (!leftAdapter) return;
+      void runCall('setVolume (left)', setLeftVolumeFb, () =>
+        leftAdapter.setVolume(rounded),
+      );
+    },
+    [leftAdapter, runCall],
+  );
+
+  const handleRightVolumeEnd = useCallback(
+    (value: number) => {
+      const rounded = Math.round(value);
+      setRightVolume(rounded);
+      if (!rightAdapter) return;
+      void runCall('setVolume (right)', setRightVolumeFb, () =>
+        rightAdapter.setVolume(rounded),
+      );
+    },
+    [rightAdapter, runCall],
   );
 
   const handleMuteToggle = useCallback(
     (value: boolean) => {
       setMuted(value);
-      if (!adapter) return;
-      void runCall('setMute', setMuteFb, () => adapter.setMute(value));
+      if (!hasAny) return;
+      void runCall('setMute', setMuteFb, () =>
+        runOnAdapters(bothAdapters, (a) => a.setMute(value)),
+      );
     },
-    [adapter, runCall],
+    [hasAny, bothAdapters, runCall],
   );
 
   const handleProgramSelect = useCallback(
     (index: number) => {
       setProgram(index);
-      if (!adapter) return;
-      void runCall('setProgram', setProgramFb, () => adapter.setProgram(index));
+      if (!hasAny) return;
+      // Programs always sync both aids
+      void runCall('setProgram', setProgramFb, () =>
+        runOnAdapters(bothAdapters, (a) => a.setProgram(index)),
+      );
     },
-    [adapter, runCall],
+    [hasAny, bothAdapters, runCall],
   );
 
   const handleRefresh = useCallback(() => {
-    if (!adapter) return;
+    if (!hasAny) return;
     void (async () => {
       setRefreshFb({ state: 'busy' });
       logBleOp('refreshState', 'in progress...');
       try {
-        const state = await adapter.refreshState();
-        setDriverState(state);
+        if (leftAdapter) {
+          const state = await leftAdapter.refreshState();
+          updateDriverState('left', state);
+        }
+        if (rightAdapter) {
+          const state = await rightAdapter.refreshState();
+          updateDriverState('right', state);
+        }
         logBleOp('refreshState', 'OK');
         setRefreshFb({ state: 'ok' });
         setTimeout(() => setRefreshFb({ state: 'idle' }), 1500);
@@ -200,37 +284,114 @@ export function ControlPanel({ brand }: ControlPanelProps) {
         setTimeout(() => setRefreshFb({ state: 'idle' }), 4000);
       }
     })();
-  }, [adapter, setDriverState, logBleOp]);
-
-  const noAdapter = !adapter;
+  }, [hasAny, leftAdapter, rightAdapter, updateDriverState, logBleOp]);
 
   return (
     <View style={styles.container}>
-      {/* Volume */}
-      <View style={styles.section}>
-        <View style={styles.sectionHeader}>
-          <Text style={styles.sectionTitle}>Volume</Text>
-          <FeedbackBadge feedback={volumeFb} />
+      {/* Linked toggle — only shown when both devices connected */}
+      {hasBoth && (
+        <View style={styles.section}>
+          <View style={styles.linkedRow}>
+            <Text style={styles.linkedLabel}>
+              Linked
+            </Text>
+            <Switch
+              value={linked}
+              onValueChange={setLinked}
+              trackColor={{ false: '#DDD', true: '#0066CC' }}
+              thumbColor="#FFF"
+            />
+          </View>
+          <Text style={styles.linkedHint}>
+            {linked
+              ? 'Controls affect both hearing aids'
+              : 'Control each hearing aid independently'}
+          </Text>
         </View>
-        <View style={styles.sliderRow}>
-          <Text style={styles.sliderLabel}>0</Text>
-          <Slider
-            style={styles.slider}
-            minimumValue={0}
-            maximumValue={100}
-            step={1}
-            value={volume}
-            onValueChange={setVolume}
-            onSlidingComplete={handleVolumeChangeEnd}
-            minimumTrackTintColor="#0066CC"
-            maximumTrackTintColor="#DDD"
-            thumbTintColor="#0066CC"
-            disabled={muted || noAdapter || volumeFb.state === 'busy'}
-          />
-          <Text style={styles.sliderLabel}>100</Text>
+      )}
+
+      {/* Volume — linked mode */}
+      {(linked || !hasBoth) && (
+        <View style={styles.section}>
+          <View style={styles.sectionHeader}>
+            <Text style={styles.sectionTitle}>Volume</Text>
+            <FeedbackBadge feedback={volumeFb} />
+          </View>
+          <View style={styles.sliderRow}>
+            <Text style={styles.sliderLabel}>0</Text>
+            <Slider
+              style={styles.slider}
+              minimumValue={0}
+              maximumValue={100}
+              step={1}
+              value={volume}
+              onValueChange={setVolume}
+              onSlidingComplete={handleLinkedVolumeEnd}
+              minimumTrackTintColor="#0066CC"
+              maximumTrackTintColor="#DDD"
+              thumbTintColor="#0066CC"
+              disabled={muted || !hasAny || volumeFb.state === 'busy'}
+            />
+            <Text style={styles.sliderLabel}>100</Text>
+          </View>
+          <Text style={styles.valueText}>{volume}%</Text>
         </View>
-        <Text style={styles.valueText}>{volume}%</Text>
-      </View>
+      )}
+
+      {/* Volume — unlinked mode (separate sliders) */}
+      {!linked && hasBoth && (
+        <>
+          <View style={styles.section}>
+            <View style={styles.sectionHeader}>
+              <Text style={styles.sectionTitle}>Volume — Left</Text>
+              <FeedbackBadge feedback={leftVolumeFb} />
+            </View>
+            <View style={styles.sliderRow}>
+              <Text style={styles.sliderLabel}>0</Text>
+              <Slider
+                style={styles.slider}
+                minimumValue={0}
+                maximumValue={100}
+                step={1}
+                value={leftVolume}
+                onValueChange={setLeftVolume}
+                onSlidingComplete={handleLeftVolumeEnd}
+                minimumTrackTintColor="#0066CC"
+                maximumTrackTintColor="#DDD"
+                thumbTintColor="#0066CC"
+                disabled={muted || !leftAdapter || leftVolumeFb.state === 'busy'}
+              />
+              <Text style={styles.sliderLabel}>100</Text>
+            </View>
+            <Text style={styles.valueText}>{leftVolume}%</Text>
+          </View>
+
+          <View style={styles.section}>
+            <View style={styles.sectionHeader}>
+              <Text style={styles.sectionTitle}>Volume — Right</Text>
+              <FeedbackBadge feedback={rightVolumeFb} />
+            </View>
+            <View style={styles.sliderRow}>
+              <Text style={styles.sliderLabel}>0</Text>
+              <Slider
+                style={styles.slider}
+                minimumValue={0}
+                maximumValue={100}
+                step={1}
+                value={rightVolume}
+                onValueChange={setRightVolume}
+                onSlidingComplete={handleRightVolumeEnd}
+                minimumTrackTintColor="#CC6600"
+                maximumTrackTintColor="#DDD"
+                thumbTintColor="#CC6600"
+                disabled={muted || !rightAdapter || rightVolumeFb.state === 'busy'}
+              />
+              <Text style={styles.sliderLabel}>100</Text>
+            </View>
+            <Text style={styles.valueText}>{rightVolume}%</Text>
+          </View>
+        </>
+      )}
 
       {/* Mute */}
       <View style={styles.section}>
@@ -244,7 +405,7 @@ export function ControlPanel({ brand }: ControlPanelProps) {
             onValueChange={handleMuteToggle}
             trackColor={{ false: '#DDD', true: '#CC3333' }}
             thumbColor="#FFF"
-            disabled={noAdapter || muteFb.state === 'busy'}
+            disabled={!hasAny || muteFb.state === 'busy'}
           />
         </View>
       </View>
@@ -265,8 +426,7 @@ export function ControlPanel({ brand }: ControlPanelProps) {
               ]}
               onPress={() => handleProgramSelect(p.index)}
               activeOpacity={0.7}
-              disabled={noAdapter || programFb.state === 'busy'}
-            >
+              disabled={!hasAny || programFb.state === 'busy'}>
               <Text
                 style={[
                   styles.programText,
@@ -284,24 +444,30 @@ export function ControlPanel({ brand }: ControlPanelProps) {
         style={styles.refreshButton}
         onPress={handleRefresh}
         activeOpacity={0.7}
-        disabled={noAdapter || refreshFb.state === 'busy'}
-      >
+        disabled={!hasAny || refreshFb.state === 'busy'}>
         <Text style={styles.refreshText}>Refresh State</Text>
         <FeedbackBadge feedback={refreshFb} />
       </TouchableOpacity>
 
-      {/* Battery */}
-      {driverState?.batteryPercent !== undefined && (
+      {/* Battery — per device */}
+      {leftDevice?.driverState?.batteryPercent !== undefined && (
         <View style={styles.batteryRow}>
           <Text style={styles.batteryText}>
-            Battery: {driverState.batteryPercent}%
+            Left Battery: {leftDevice.driverState.batteryPercent}%
+          </Text>
+        </View>
+      )}
+      {rightDevice?.driverState?.batteryPercent !== undefined && (
+        <View style={styles.batteryRow}>
+          <Text style={styles.batteryText}>
+            Right Battery: {rightDevice.driverState.batteryPercent}%
           </Text>
         </View>
       )}
 
-      {noAdapter && (
+      {!hasAny && (
         <Text style={styles.stubNote}>
-          Adapter not connected. Controls disabled.
+          No hearing aids connected. Go back to scan and connect.
         </Text>
       )}
     </View>
@@ -332,6 +498,21 @@ const styles = StyleSheet.create({
     fontSize: 16,
     fontWeight: '600',
     color: '#1A1A1A',
+  },
+  linkedRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+  },
+  linkedLabel: {
+    fontSize: 16,
+    fontWeight: '600',
+    color: '#0066CC',
+  },
+  linkedHint: {
+    fontSize: 12,
+    color: '#999',
+    marginTop: 4,
   },
   sliderRow: {
     flexDirection: 'row',

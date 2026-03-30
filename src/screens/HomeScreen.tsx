@@ -1,5 +1,6 @@
 /**
- * HomeScreen — scan for BLE hearing aid devices and list results.
+ * HomeScreen — scan for BLE hearing aid devices, show connected device slots,
+ * and list scan results. Supports dual (left + right) hearing aid connections.
  */
 import React, { useCallback, useEffect, useRef } from 'react';
 import {
@@ -12,12 +13,15 @@ import {
 } from 'react-native';
 import { PERMISSIONS, request, requestMultiple } from 'react-native-permissions';
 import { useDeviceStore } from '../store/deviceStore';
+import type { DeviceSlot } from '../store/deviceStore';
 import { startScan, getBondedDevices } from '../ble/scanner';
 import type { DiscoveredDevice } from '../ble/types';
 import type { StackNavigationProp } from '@react-navigation/stack';
+import type { RootStackParamList } from '../../App';
+import { getBleManager } from '../ble/BleManager';
 
 type HomeScreenProps = {
-  navigation: StackNavigationProp<any>;
+  navigation: StackNavigationProp<RootStackParamList>;
 };
 
 const BRAND_LABELS: Record<string, string> = {
@@ -66,6 +70,54 @@ async function requestBlePermissions(): Promise<boolean> {
   return result === 'granted';
 }
 
+/** Connected device slot card */
+function DeviceSlotCard({
+  label,
+  slot,
+  onDisconnect,
+}: {
+  label: string;
+  slot: DeviceSlot | null;
+  onDisconnect: () => void;
+}) {
+  return (
+    <View style={[slotStyles.card, slot && slotStyles.cardConnected]}>
+      <Text style={slotStyles.label}>{label}</Text>
+      {slot ? (
+        <>
+          <Text style={slotStyles.name} numberOfLines={1}>
+            {slot.deviceName ?? 'Unknown'}
+          </Text>
+          <View style={slotStyles.row}>
+            <View
+              style={[
+                slotStyles.brandBadge,
+                { backgroundColor: BRAND_COLORS[slot.brand] ?? '#888' },
+              ]}>
+              <Text style={slotStyles.brandText}>
+                {BRAND_LABELS[slot.brand] ?? slot.brand}
+              </Text>
+            </View>
+            {slot.driverState?.batteryPercent !== undefined && (
+              <Text style={slotStyles.battery}>
+                {slot.driverState.batteryPercent}%
+              </Text>
+            )}
+          </View>
+          <TouchableOpacity
+            style={slotStyles.disconnectBtn}
+            onPress={onDisconnect}
+            activeOpacity={0.7}>
+            <Text style={slotStyles.disconnectText}>Disconnect</Text>
+          </TouchableOpacity>
+        </>
+      ) : (
+        <Text style={slotStyles.empty}>Not connected</Text>
+      )}
+    </View>
+  );
+}
+
 export function HomeScreen({ navigation }: HomeScreenProps) {
   const {
     isScanning,
@@ -73,6 +125,9 @@ export function HomeScreen({ navigation }: HomeScreenProps) {
     setScanning,
     addDiscoveredDevice,
     clearDiscoveredDevices,
+    leftDevice,
+    rightDevice,
+    setDeviceSlot,
   } = useDeviceStore();
   const stopScanRef = useRef<(() => void) | null>(null);
 
@@ -85,13 +140,20 @@ export function HomeScreen({ navigation }: HomeScreenProps) {
     }
 
     const granted = await requestBlePermissions();
-    if (!granted) {
-      // TODO: Show user-friendly permission denied message
-      return;
-    }
+    if (!granted) return;
 
     clearDiscoveredDevices();
     setScanning(true);
+
+    // Re-show OS-paired BLE devices so they are not lost after clear
+    try {
+      const bonded = await getBondedDevices();
+      for (const d of bonded) {
+        addDiscoveredDevice(d);
+      }
+    } catch {
+      // ignore
+    }
 
     stopScanRef.current = startScan((device) => {
       addDiscoveredDevice(device);
@@ -107,7 +169,7 @@ export function HomeScreen({ navigation }: HomeScreenProps) {
     }, 15000);
   }, [isScanning, setScanning, addDiscoveredDevice, clearDiscoveredDevices]);
 
-  // Load already-bonded devices on mount, before scanning
+  // Load already-bonded devices on mount
   useEffect(() => {
     void (async () => {
       try {
@@ -123,19 +185,48 @@ export function HomeScreen({ navigation }: HomeScreenProps) {
 
   useEffect(() => {
     return () => {
-      // Cleanup on unmount
       stopScanRef.current?.();
     };
   }, []);
 
+  const handleDisconnect = useCallback(
+    async (side: 'left' | 'right') => {
+      const device = side === 'left' ? leftDevice : rightDevice;
+      if (!device) return;
+      try {
+        await device.adapter.disconnect();
+      } catch {
+        // ignore
+      }
+      try {
+        await getBleManager().cancelDeviceConnection(device.deviceId);
+      } catch {
+        // ignore
+      }
+      setDeviceSlot(side, null);
+    },
+    [leftDevice, rightDevice, setDeviceSlot],
+  );
+
   const handleDevicePress = useCallback(
     (device: DiscoveredDevice) => {
+      // Don't re-connect an already connected device
+      if (leftDevice?.deviceId === device.id || rightDevice?.deviceId === device.id) {
+        return;
+      }
       stopScanRef.current?.();
       stopScanRef.current = null;
       setScanning(false);
       navigation.navigate('Device', { device });
     },
-    [navigation, setScanning],
+    [navigation, setScanning, leftDevice, rightDevice],
+  );
+
+  const hasAnyConnection = leftDevice != null || rightDevice != null;
+
+  // Filter out already-connected devices from the scan list
+  const filteredDevices = discoveredDevices.filter(
+    (d) => d.id !== leftDevice?.deviceId && d.id !== rightDevice?.deviceId,
   );
 
   const renderDevice = ({ item }: { item: DiscoveredDevice }) => (
@@ -181,6 +272,29 @@ export function HomeScreen({ navigation }: HomeScreenProps) {
         Scan for nearby Bluetooth devices
       </Text>
 
+      {/* Connected device slots */}
+      <View style={slotStyles.row2}>
+        <DeviceSlotCard
+          label="Left Ear"
+          slot={leftDevice}
+          onDisconnect={() => handleDisconnect('left')}
+        />
+        <DeviceSlotCard
+          label="Right Ear"
+          slot={rightDevice}
+          onDisconnect={() => handleDisconnect('right')}
+        />
+      </View>
+
+      {hasAnyConnection && (
+        <TouchableOpacity
+          style={styles.controlsButton}
+          onPress={() => navigation.navigate('DualControl')}
+          activeOpacity={0.8}>
+          <Text style={styles.controlsButtonText}>Open Controls</Text>
+        </TouchableOpacity>
+      )}
+
       <TouchableOpacity
         style={[styles.scanButton, isScanning && styles.scanButtonActive]}
         onPress={handleScan}
@@ -190,17 +304,17 @@ export function HomeScreen({ navigation }: HomeScreenProps) {
         </Text>
       </TouchableOpacity>
 
-      {discoveredDevices.length > 0 && (
+      {filteredDevices.length > 0 && (
         <>
           <Text style={styles.resultsLabel}>
-            {discoveredDevices.length} device{discoveredDevices.length !== 1 ? 's' : ''} found
+            {filteredDevices.length} device{filteredDevices.length !== 1 ? 's' : ''} found
           </Text>
-          <Text style={styles.tapHint}>Tap any device to identify it</Text>
+          <Text style={styles.tapHint}>Tap any device to connect</Text>
         </>
       )}
 
       <FlatList
-        data={discoveredDevices}
+        data={filteredDevices}
         keyExtractor={(item) => item.id}
         renderItem={renderDevice}
         contentContainerStyle={styles.list}
@@ -218,6 +332,83 @@ export function HomeScreen({ navigation }: HomeScreenProps) {
   );
 }
 
+const slotStyles = StyleSheet.create({
+  row2: {
+    flexDirection: 'row',
+    gap: 10,
+    marginBottom: 12,
+  },
+  card: {
+    flex: 1,
+    backgroundColor: '#FFF',
+    borderRadius: 10,
+    padding: 12,
+    borderWidth: 1.5,
+    borderColor: '#E0E0E0',
+    elevation: 2,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.1,
+    shadowRadius: 3,
+  },
+  cardConnected: {
+    borderColor: '#0066CC',
+  },
+  label: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: '#666',
+    textTransform: 'uppercase',
+    letterSpacing: 0.5,
+    marginBottom: 4,
+  },
+  name: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: '#1A1A1A',
+    marginBottom: 6,
+  },
+  row: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    marginBottom: 8,
+  },
+  brandBadge: {
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    borderRadius: 4,
+  },
+  brandText: {
+    color: '#FFF',
+    fontSize: 10,
+    fontWeight: '600',
+  },
+  battery: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: '#333',
+  },
+  empty: {
+    fontSize: 13,
+    color: '#AAAAAA',
+    fontStyle: 'italic',
+    marginTop: 4,
+  },
+  disconnectBtn: {
+    paddingVertical: 4,
+    paddingHorizontal: 8,
+    backgroundColor: '#FFEEEE',
+    borderRadius: 6,
+    alignSelf: 'flex-start',
+  },
+  disconnectText: {
+    fontSize: 11,
+    fontWeight: '600',
+    color: '#CC3333',
+  },
+});
+
 const styles = StyleSheet.create({
   container: {
     flex: 1,
@@ -234,7 +425,19 @@ const styles = StyleSheet.create({
   subtitle: {
     fontSize: 14,
     color: '#666',
-    marginBottom: 20,
+    marginBottom: 16,
+  },
+  controlsButton: {
+    backgroundColor: '#228B22',
+    paddingVertical: 14,
+    borderRadius: 10,
+    alignItems: 'center',
+    marginBottom: 12,
+  },
+  controlsButtonText: {
+    color: '#FFF',
+    fontSize: 16,
+    fontWeight: '600',
   },
   scanButton: {
     backgroundColor: '#0066CC',
