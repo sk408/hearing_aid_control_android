@@ -1,68 +1,61 @@
 /**
  * ReSound / GN Hearing BLE adapter
  *
- * Protocol reference: SPEC.md §2.4, command_dictionary.md, resound_uuid_reference_master
+ * ── Sources ──
+ *
+ * | Source                         | Artifact                                                              |
+ * |--------------------------------|-----------------------------------------------------------------------|
+ * | ILSpy decompile spec           | hearing_aid_control/docs/resound_gn_encryption_1.3.0_ilspy.md         |
+ * | Decompiled C# (primary)        | artifacts/decompiled/resound_smart3d_1.3.0_ble/ (AESDeEncoder.cs,     |
+ * |                                | P6TrustKeyHandler.cs, HandleBasedPlatform.cs, GNConstants.cs)         |
+ * | Smart 3D 1.3.0 static GATT XML | hearing_aid_control/docs/resound_smart3d_1.3.0_ble_static.md          |
+ * | Legacy Java client             | hearing_aid_control/docs/resound_legacy_ble_smart_3.3.1.md            |
+ * | UUID dossier / master          | hearing_aid_control/docs/uuid_resound_dossier_2026-03-28.md           |
+ * | APK provenance                 | ReSound Smart 3D_1.3.0_APKPure.apk → assemblies/BLE.dll              |
+ *
+ * ── Service placement ──
+ *
+ * GN command/notify/security/version/challenge/public-key UUIDs from ILSpy
+ * belong under 0000fefe (or Palpatine 4d56d4f5), NOT e0262760. The e026
+ * family appears on newer stacks; FEFE + command UUIDs are the primary path.
+ * Fallback order: charServiceMap → FEFE → Palpatine P5 → e0262760.
+ *
+ * ── Three client eras ──
+ *
+ * (a) ReSound Smart 3.3.1 — pure Java, direct FEFE writes, no e026/1959a468.
+ * (b) Smart 3D 1.3.0 — Xamarin BLE.dll, FEFE/Palpatine GATT + GNCommand/GNNotify.
+ * (c) Smart 3D 1.43.1+ — adds e0262760 family alongside FEFE/command stack.
+ *
+ * ── Encryption ──
+ *
+ * Optional trusted bond; session uses AES counter keystream (AESDeEncoder),
+ * keys from P6TrustKeyHandler (challenge + AppBaseKeys + ECDH P-256 + SHA-256).
+ * Plaintext path: WriteDataToCommandInterfaceNoEncryption / discover [0x06].
+ * Auth handshake: "APP says hi " → "HI says hi" verification.
+ * See src/ble/gn/ for encryption implementation.
  *
  * ── CONFIRMED paths ──
  *
  *   ASHA volume:    00e4ca9e-ab14-41e4-8823-f9e70c7e91df
  *                   Signed int8 [-128..0] where 0 = max, -128 = min/mute.
  *                   Property: WRITE_NO_RESP (not WRITE).
- *                   Primary volume control path.
  *
  *   MFi HAP service (7d74f4bd-c74a-4431-862c-cce884371592):
- *     Program name:  7be94a55-8d91-4592-bc0f-ea3664ccd3a9  R/W  — UTF-8 current program name
- *     Program count: 7a62b786-f2ef-4afb-9aa8-81cc62a25862  R/N  — uint8
- *     Ear side:      8d17ac2f-1d54-4742-a49a-ef4b20784eb3  R    — 0=left, 1=right
+ *     Program name:  7be94a55-8d91-4592-bc0f-ea3664ccd3a9  R/W
+ *     Program count: 7a62b786-f2ef-4afb-9aa8-81cc62a25862  R/N
+ *     Ear side:      8d17ac2f-1d54-4742-a49a-ef4b20784eb3  R
  *
- *   ReSound service (a53062b9-7dfd-446c-bca5-1e13269560bd):
- *     Battery:       539e6ea0-31e5-485a-a5a2-39fb763f0e08  R/N  — GN_BATTERY enum
- *     Program count: 7a62b786-f2ef-4afb-9aa8-81cc62a25862  R/N  — uint8
- *
- *   GN Battery enum: 1=low(5%), 5=prev_low(30%), 10=OK(100%).
- *   GN Side: 0=left, 1=right.
- *
- * ── GN Handle Protocol (confirmed response format) ──
- *
- *   Success: [0x03, handle, data_len, ...data]
- *   Error:   [0x08, 0x04, handle, 0x81] (0x81 = not permitted)
- *
- *   Confirmed readable handles:
- *     0x02 → 1 byte
- *     0x03 → 7 bytes (obfuscated program list)
- *     0x04 → 7 bytes (obfuscated program list)
- *     0x14 → 1 byte = 0x05
- *     0x1a → 8 bytes
- *
- * ── PARTIAL / UNCONFIRMED paths ──
- *
- *   GN Command:     1959a468-3234-4c18-9e78-8daf8d9dbf61
- *   GN Notify:      8b51a2ca-5bed-418b-b54b-22fe666aadd2
- *
- *   GN command frame protocol (confirmed framing, unconfirmed handle IDs):
- *     write handle:  [0x03, handleLow, payload...]
- *     read handle:   [0x04, handleLow]
- *     read blob:     [0x05, handleLow, 0x00, 0x00]
- *     discover:      [0x06]
- *
- *   Candidate handle IDs (from command_dictionary.md — PARTIAL confidence):
- *     0x05 = GNMicAttenuation      — [0x03, 0x05, program, attenuation]
- *     0x06 = GNStreamAttenuation   — [0x03, 0x06, program, attenuation]
- *     0x08 = GNCurrentActiveProgram — [0x03, 0x08, programIndex]
- *     0x15 = GNStreamStatus (read) — [0x04, 0x15]
- *
- *   Direct characteristic UUIDs (from service description XMLs — whether
- *   these are directly R/W or only accessible via handle tunnel is UNKNOWN):
+ *   Direct GN characteristics (under FEFE / P5 service):
  *     GNMicAttenuation:       32c9322d-6b17-11cf-0234-6f0da5eafd75  (0=mute, 1..255)
  *     GNStreamAttenuation:    054e99c7-ff34-1c12-59cd-e2c20d2e6743  (0=mute, 1..255)
  *     GNCurrentActiveProgram: dc82f820-63ac-f82f-1e89-372fde4151f4
- *     GNHiState:              8d552f91-15d0-4628-a03f-1a64fc88fa51
- *     GNFeatureSupport:       650c3a00-cb6d-467d-a20b-3544f189d8af  (4-byte bitfield)
  *
- * Status: HA gain uses GN mic attenuation (UUID / handle 0x05) when exposed;
- *         ASHA volume is fallback (streaming-oriented). Program: GNCurrentActiveProgram
- *         direct write or [0x03,0x08,idx]. Official app may encrypt GN command frames —
- *         if writes are rejected, capture plaintext/encrypt boundary (phase3 docs).
+ *   GN Handle Protocol:
+ *     write:    [0x03, handle, payload...]
+ *     read:     [0x04, handle]
+ *     blob:     [0x05, handle, 0x00, 0x00]
+ *     discover: [0x06]
+ *     Handles: 0x05=MicAtten, 0x06=StreamAtten, 0x08=ActiveProgram
  */
 import type { Device } from 'react-native-ble-plx';
 import { getBleManager } from '../ble/BleManager';
@@ -74,8 +67,10 @@ import type { DeviceInfo, Feature, Program } from '../ble/types';
 const ASHA_SERVICE = '0000fdf0-0000-1000-8000-00805f9b34fb';
 const ASHA_VOLUME_CHAR = '00e4ca9e-ab14-41e4-8823-f9e70c7e91df';
 
-// ── GN proprietary service (SPEC.md §2.4) ──
+// ── GN services — FEFE (primary) → Palpatine P5 → e0262760 (newer stacks) ──
 
+const GN_FEFE_SERVICE = '0000fefe-0000-1000-8000-00805f9b34fb';
+const GN_PALPATINE_SERVICE = '4d56d4f5-0000-1000-8000-00805f9b34fb';
 const GN_SERVICE = 'e0262760-08c2-11e1-9073-0e8ac72ea010';
 const GN_COMMAND_CHAR = '1959a468-3234-4c18-9e78-8daf8d9dbf61';
 const GN_NOTIFY_CHAR = '8b51a2ca-5bed-418b-b54b-22fe666aadd2';
@@ -99,8 +94,10 @@ const GN_SIDE_CHAR = '8d17ac2f-1d54-4742-a49a-ef4b20784eb3';
 const GN_ACTIVE_PROGRAM_CHAR = 'dc82f820-63ac-f82f-1e89-372fde4151f4';
 /** GN security capability — trust bootstrap per resound_phase2_static.md §5 */
 const GN_SECURITY_CAP_CHAR = '12257119-ddcb-4a12-9a08-1cd4df7921bb';
-/** Microphone / HA gain (not streaming-only ASHA volume) — Dooku3 handle 0x05 */
+/** Microphone / HA gain (not streaming-only ASHA volume) — handle 0x05 */
 const GN_MIC_ATTENUATION_CHAR = '32c9322d-6b17-11cf-0234-6f0da5eafd75';
+/** Streaming attenuation — handle 0x06, 0=mute 1..255 */
+const GN_STREAM_ATTENUATION_CHAR = '054e99c7-ff34-1c12-59cd-e2c20d2e6743';
 
 // ── Standard BLE Battery Service ──
 
@@ -179,6 +176,10 @@ export class ResoundAdapter implements HearingAidAdapter {
 
   /** Characteristic UUID (lowercase) → parent service UUID, built during connect */
   private charServiceMap = new Map<string, string>();
+  /** All discovered service UUIDs (lowercase), populated during connect */
+  private discoveredServices = new Set<string>();
+  /** Cached resolved GN service UUID (FEFE → P5 → e026 chain) */
+  private gnResolvedService: string | null = null;
 
   /** GN notify data handler — replaced temporarily during discover() */
   private onGnNotify: (data: number[]) => void = () => {};
@@ -234,6 +235,8 @@ export class ResoundAdapter implements HearingAidAdapter {
       this.device = null;
       this.deviceId = null;
       this.charServiceMap.clear();
+      this.discoveredServices.clear();
+      this.gnResolvedService = null;
       this.gnTrustBootstrapDone = false;
     }
   }
@@ -490,10 +493,54 @@ export class ResoundAdapter implements HearingAidAdapter {
     }
   }
 
-  // ── Streaming volume (ASHA = streaming volume) ──
+  // ── Streaming volume ──
+  //
+  // Primary: GN stream attenuation (054e99c7 / handle 0x06).
+  // Fallback: ASHA volume (streaming-oriented int8).
 
   async setStreamingVolume(level: number): Promise<void> {
-    await this.setVolume(level);
+    const clampedLevel = Math.max(0, Math.min(100, level));
+    await this.ensureGnTrustBootstrap();
+
+    const attenuation =
+      clampedLevel <= 0
+        ? 0
+        : Math.max(1, Math.min(255, Math.round((clampedLevel / 100) * 255)));
+
+    let program = await this.readRawActiveProgramIndex();
+    if (program === null) program = 0;
+
+    // Try direct GN stream attenuation characteristic
+    const streamKey = GN_STREAM_ATTENUATION_CHAR.toLowerCase();
+    if (this.charServiceMap.has(streamKey)) {
+      const svc = this.findService(GN_STREAM_ATTENUATION_CHAR);
+      try {
+        await this.writeCharacteristicBothModes(svc, GN_STREAM_ATTENUATION_CHAR, [
+          program,
+          attenuation,
+        ]);
+        return;
+      } catch {
+        try {
+          await this.writeCharacteristicBothModes(svc, GN_STREAM_ATTENUATION_CHAR, [
+            attenuation,
+          ]);
+          return;
+        } catch {
+          // try command tunnel
+        }
+      }
+    }
+
+    // Try GN command tunnel — handle 0x06 = GNStreamAttenuation
+    try {
+      await this.writeGnCommandFrame([0x03, 0x06, program, attenuation]);
+      return;
+    } catch {
+      // ASHA fallback
+    }
+
+    await this.setVolumeAsha(clampedLevel);
   }
 
   // ── GN Discover ──
@@ -707,7 +754,7 @@ export class ResoundAdapter implements HearingAidAdapter {
     // NOT included until validated on hardware:
     //   streaming: dedicated stream attenuation handle 0x06
     //   balance, tinnitus, eq: no known path
-    return ['volume', 'mute', 'battery', 'program'];
+    return ['volume', 'mute', 'battery', 'program', 'streaming'];
   }
 
   // ── Private helpers ──
@@ -723,6 +770,7 @@ export class ResoundAdapter implements HearingAidAdapter {
     try {
       const services = await dev.services();
       for (const service of services) {
+        this.discoveredServices.add(service.uuid.toLowerCase());
         try {
           const chars = await service.characteristics();
           for (const char of chars) {
@@ -739,7 +787,8 @@ export class ResoundAdapter implements HearingAidAdapter {
 
   /**
    * Find the parent service UUID for a characteristic.
-   * Uses discovery cache, falls back to known service UUIDs.
+   * Prefers charServiceMap (live discovery); then known non-GN services;
+   * then FEFE → Palpatine P5 → e0262760 for GN UUIDs.
    */
   private findService(charUUID: string): string {
     const cached = this.charServiceMap.get(charUUID.toLowerCase());
@@ -755,7 +804,28 @@ export class ResoundAdapter implements HearingAidAdapter {
     ) {
       return MFIHAP_SERVICE;
     }
-    return GN_SERVICE;
+    // GN chars: FEFE → Palpatine P5 → e0262760 fallback
+    return this.resolveGnService();
+  }
+
+  /**
+   * Resolve the GN service UUID from discovered services.
+   * Priority: FEFE (primary for Smart 3D 1.3.0) → Palpatine P5 → e0262760 (newer).
+   * Cached after first resolution per connection.
+   */
+  private resolveGnService(): string {
+    if (this.gnResolvedService) return this.gnResolvedService;
+
+    if (this.discoveredServices.has(GN_FEFE_SERVICE.toLowerCase())) {
+      this.gnResolvedService = GN_FEFE_SERVICE;
+    } else if (this.discoveredServices.has(GN_PALPATINE_SERVICE.toLowerCase())) {
+      this.gnResolvedService = GN_PALPATINE_SERVICE;
+    } else {
+      this.gnResolvedService = GN_SERVICE;
+    }
+
+    console.log('[ResoundAdapter] GN service resolved:', this.gnResolvedService);
+    return this.gnResolvedService;
   }
 
   private async readRawActiveProgramIndex(): Promise<number | null> {

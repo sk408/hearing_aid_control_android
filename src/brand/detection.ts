@@ -8,9 +8,14 @@
  */
 import type { Brand } from '../ble/types';
 
-/** GN command / notify — present on ReSound when those services are authorized. */
+/** FEFE service — primary GN proprietary service on ReSound Smart 3D 1.3.0+ */
+const RESOUND_FEFE_SERVICE = '0000fefe-0000-1000-8000-00805f9b34fb';
+
+/** GN characteristics that confirm ReSound identity (when under FEFE service) */
 const RESOUND_GN_COMMAND = '1959a468-3234-4c18-9e78-8daf8d9dbf61';
 const RESOUND_GN_NOTIFY = '8b51a2ca-5bed-418b-b54b-22fe666aadd2';
+const RESOUND_GN_MIC_ATTENUATION = '32c9322d-6b17-11cf-0234-6f0da5eafd75';
+const RESOUND_GN_ACTIVE_PROGRAM = 'dc82f820-63ac-f82f-1e89-372fde4151f4';
 
 function normalizeUuid(uuid: string): string {
   return uuid.toLowerCase().replace(/-/g, '');
@@ -50,17 +55,21 @@ export function detectBrandFromDiscovery(
     return 'starkey';
   }
 
-  // 2. ReSound — e0262760 prefix family
+  // 2. ReSound — e0262760 prefix family (newer stacks)
   if (hasPrefix(normServices, 'e0262760')) {
     return 'resound';
   }
 
-  // 3. ReSound — GN command/notify characteristics
-  if (
-    hasCharacteristic(normChars, RESOUND_GN_COMMAND) ||
-    hasCharacteristic(normChars, RESOUND_GN_NOTIFY)
-  ) {
-    return 'resound';
+  // 3. ReSound — FEFE service + any GN characteristic (tightened to avoid false positives)
+  if (hasService(normServices, RESOUND_FEFE_SERVICE)) {
+    if (
+      hasCharacteristic(normChars, RESOUND_GN_COMMAND) ||
+      hasCharacteristic(normChars, RESOUND_GN_NOTIFY) ||
+      hasCharacteristic(normChars, RESOUND_GN_MIC_ATTENUATION) ||
+      hasCharacteristic(normChars, RESOUND_GN_ACTIVE_PROGRAM)
+    ) {
+      return 'resound';
+    }
   }
 
   // 4. Philips / Rexton — shared POLARIS service, differentiated by Terminal IO
