@@ -1447,9 +1447,11 @@ export class ResoundAdapter implements HearingAidAdapter {
   private parseBondAuthDecryptOk(aesEncoder: AESDeEncoder, data: number[]): { sharedAppIndex: number } | null {
     if (data.length < 3 || data[0] !== 0x01 || data[1] !== AUTH_STATUS_OK) return null;
     const cipher = data.slice(2);
-    if (cipher.length < 16) return null;
+    if (cipher.length < 2) return null;
     try {
       const dec = aesEncoder.decrypt(new Uint8Array(cipher));
+      console.log('[Crypto Debug] Decrypted response:', Array.from(dec).map(b => '0x' + b.toString(16).padStart(2,'0')).join(' '));
+      console.log('[Crypto Debug] Decoded text:', utf8Decode(dec.slice(1)));
       if (dec.length < 2) return null;
       const text = utf8Decode(dec.slice(1));
       if (text !== AUTH_HI_SAYS_HI && !text.includes(AUTH_HI_SAYS_HI)) return null;
