@@ -165,19 +165,20 @@ function incrementCounter(counter: Uint8Array): void {
 // challenge + ECDH to derive session keys. Treat as obfuscation, not
 // user-isolated secrecy (see ILSpy doc §5.1).
 //
-// TODO: Extract actual byte values from decompiled AESDeEncoder.cs:
-//   artifacts/decompiled/resound_smart3d_1.3.0_ble/BLE/HI/AESDeEncoder.cs
-// Run: .\tools\ilspy_ble_resound_smart3d.ps1 -ApkPath "ReSound Smart 3D_1.3.0_APKPure.apk"
-// Then copy the AppBaseKeys and AppBaseKeys_2 byte arrays here.
-
-/** AppBaseKeys — version 1 base key (32 bytes, one row). Placeholder until extracted. */
+/** AppBaseKeys — version 1 base key (32 bytes, one row). From decompiled AESDeEncoder.cs. */
 export const APP_BASE_KEYS: Uint8Array[] = [
-  new Uint8Array(32), // TODO: fill from decompiled AESDeEncoder.cs
+  new Uint8Array([
+    213, 232, 229, 12, 62, 139, 100, 133, 134, 38, 234, 67, 247, 36, 122, 230,
+    214, 101, 61, 219, 62, 136, 213, 87, 193, 137, 138, 229, 45, 246, 104, 147,
+  ]),
 ];
 
-/** AppBaseKeys_2 — version != 1 base key (32 bytes, one row). Placeholder until extracted. */
+/** AppBaseKeys_2 — version != 1 base key (32 bytes, one row). From decompiled AESDeEncoder.cs. */
 export const APP_BASE_KEYS_2: Uint8Array[] = [
-  new Uint8Array(32), // TODO: fill from decompiled AESDeEncoder.cs
+  new Uint8Array([
+    84, 104, 169, 138, 255, 144, 217, 85, 196, 139, 127, 31, 152, 23, 15, 83,
+    233, 81, 198, 225, 126, 85, 162, 208, 91, 209, 139, 126, 65, 86, 47, 100,
+  ]),
 ];
 
 /**

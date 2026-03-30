@@ -33,6 +33,24 @@ export const GN_DFU_COMMAND_CHAR = 'b69669b0-effb-4568-9862-7d82f3391170';
 /** DFU notify responses */
 export const GN_DFU_NOTIFY_CHAR = '1bcd1f06-1e72-4dad-8edb-8bfaeb4fe812';
 
+/** DFU version */
+export const GN_DFU_VERSION_CHAR = '53df4e1c-43e1-497e-8edf-589f48aafd9a';
+
+/** DFU security capability */
+export const GN_DFU_SECURITY_CAP_CHAR = 'deb1c8c1-ec5e-42d3-9d0f-4d108a3c612c';
+
+/** DFU trusted-app challenge */
+export const GN_DFU_TRUSTED_APP_CHALLENGE_CHAR = '6eae2d11-57a1-43bf-be4a-6326d0d94e88';
+
+/** DFU firmware image write */
+export const GN_DFU_FLASH_WRT_CHAR = '7009c09b-b94f-42d4-8d68-676059f153ab';
+
+/** DFU certificate write */
+export const GN_DFU_CERTIFICATE_WRT_CHAR = 'c853ac0b-2175-4d1d-8396-8f866d1ba821';
+
+/** DFU MTU */
+export const GN_DFU_MTU_CHAR = 'de1e1fd9-6056-4d89-8c49-5c3907ab694f';
+
 // ── Security / trust characteristics ──
 
 /** GN version — read to get protocol version */
@@ -69,6 +87,12 @@ export const GN_FEATURE_SUPPORT_CHAR = '650c3a00-cb6d-467d-a20b-3544f189d8af';
 
 /** GN battery enum: 1=low(5%), 5=prev_low(30%), 10=OK(100%) */
 export const GN_BATTERY_CHAR = '86e2c601-d90a-2628-19b9-bdb38d5c7cf0';
+
+/** GN battery level (from GNConstants.cs — different from the direct-read battery above) */
+export const GN_BATTERY_LEVEL_CHAR = '24e1dff3-ae90-41bf-bfbd-2cf8df42bf87';
+
+/** Client Characteristic Configuration Descriptor */
+export const GN_CC_DESCRIPTOR = '00002902-0000-1000-8000-00805f9b34fb';
 
 /** Ear side — 0=left, 1=right */
 export const GN_SIDE_CHAR = '8d17ac2f-1d54-4742-a49a-ef4b20784eb3';
