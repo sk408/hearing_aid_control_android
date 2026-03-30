@@ -1,28 +1,29 @@
 /**
  * Philips / Oticon (POLARIS platform) BLE adapter
  *
- * Protocol reference: philips_uuid_dossier docs, SPEC.md §2.1
+ * Supports two proprietary service paths:
  *
- * Primary service:   56772eaf-2153-4f74-acf3-4368d99fbf5a
+ * 1. POLARIS service (56772eaf) — older/current generation (Oticon/Demant stack)
+ *    Volume channels (all 2-byte: [level, invMute] where 1=unmuted, 0=muted):
+ *      Main volume:     1454e9d6  (write-no-response)
+ *      Streaming volume: 50632720 (write-no-response)
+ *      Tinnitus/mic:    e5892ebe  (write-no-response)
+ *      Volume ranges:   58bbccc5  (read-only, byte pairs min/max)
+ *    Program control:
+ *      Program select:  535442f7  [(byte) targetProgram]
+ *      Available progs: dcbe7a3e  bitset + sentinel(255)
+ *      List gate:       68bfa64e  handshake, ready=255
+ *      Metadata record: bba1c7f1  [category, nameLen, ...name, flags]
  *
- * Volume channels (all 2-byte: [level, invMute] where 1=unmuted, 0=muted):
- *   Main volume:     1454e9d6-f658-4190-8589-22aa9e3021eb  (write-no-response)
- *   Streaming volume: 50632720-4c0f-4bc4-960a-2404bdfdfbca (write-no-response)
- *   Tinnitus/mic:    e5892ebe-97d0-4f97-8f8e-cb85d16a4cc1  (write-no-response)
- *   Volume ranges:   58bbccc5-5a57-4e00-98d5-18c6a0408dfd  (read-only, byte pairs min/max)
+ * 2. HearLink proprietary service (ba50125d) — newer generation (HearLink 9050+)
+ *    Discovered via live BLE probe on "GUDNY Hearing Aids" (HearLink 9050, FW rel_7.3_30.0).
+ *    Command/response via 43c8465e (WRITE+NOTIFY).
+ *    State read via e6c02a45 (READ, 12-byte payload: bytes[8..10] appear to be volume levels).
+ *    Wire protocol for ba50125d is not yet fully decoded — command format is inferred.
  *
- * Program control:
- *   Program select:  535442f7-0ff7-4fec-9780-742f3eb00eda  [(byte) targetProgram]
- *   Program version: 42e940ef-98c8-4ccd-a557-30425295af89  int32, triggers list refresh
- *   Available progs: dcbe7a3e-a742-4527-aeb5-cd8dee63167f  bitset + sentinel(255)
- *   List gate:       68bfa64e-3209-4172-b117-f7eafce17414  handshake, ready=255
- *   Metadata record: bba1c7f1-b445-4657-90c3-8dbd97361a0c  [category, nameLen, ...name, flags]
- *
- * Other:
- *   Device ID:       5f35c43d-e0f4-4da9-87e6-9719982cd25e  (read)
- *   ASHA volume:     00e4ca9e-ab14-41e4-8823-f9e70c7e91df  signed int8 [-128..0]
+ * Both paths use standard BLE Battery Service (0x180F) and Device Information (0x180A).
  */
-import type { Device } from 'react-native-ble-plx';
+import type { Device, Subscription } from 'react-native-ble-plx';
 import { getBleManager } from '../ble/BleManager';
 import type { HearingAidAdapter, DriverState } from './types';
 import type { DeviceInfo, Feature, Program } from '../ble/types';
@@ -72,7 +73,47 @@ const DEVICE_ID_CHAR = '5f35c43d-e0f4-4da9-87e6-9719982cd25e';
 /** ASHA volume fallback — signed int8 [-128..0] (confirmed) */
 const ASHA_VOLUME_CHAR = '00e4ca9e-ab14-41e4-8823-f9e70c7e91df';
 
-// ── Standard BLE Battery Service ──
+// ── Philips HearLink proprietary service (live probe: HearLink 9050, FW rel_7.3_30.0) ──
+// Distinct from POLARIS — found on newer HearLink models alongside LE Audio/ASHA services.
+
+const HEARLINK_SERVICE = 'ba50125d-0806-42ab-8bf1-22e0b954a8fa';
+
+/** Device state/config (READ). Probe returned 12 bytes: 01 01 01 00 00 f4 06 03 80 80 80 00.
+ *  Bytes[8..10] = 0x80 each — likely volume/balance/tinnitus at midpoint. */
+const HL_STATE_CHAR = 'e6c02a45-a0e5-41f2-9cd1-c1fab9ec0c3e';
+
+/** Primary command/control channel (WRITE, NOTIFY). Used for volume/program control.
+ *  Wire protocol not yet fully decoded — command format inferred from POLARIS patterns. */
+const HL_COMMAND_CHAR = '43c8465e-ba80-451d-8098-57716b4fdbe5';
+
+/** Write channel A (WRITE, WRITE_NO_RESP). Semantic TBD — may be data/config transport. */
+const HL_WRITE_A_CHAR = '855c8579-17b7-40a8-be4f-ad574357f797';
+
+/** Write channel B (WRITE, WRITE_NO_RESP). Semantic TBD. */
+const HL_WRITE_B_CHAR = '6d6a8b8f-544e-4ef1-be91-c60db8e70884';
+
+/** Write channel C (WRITE, WRITE_NO_RESP). Semantic TBD. */
+const HL_WRITE_C_CHAR = 'f6c47754-8bd2-4cc2-bf0b-fdee78fa812e';
+
+/** Status notification A (NOTIFY only). */
+const HL_NOTIFY_A_CHAR = '5eb7ff93-ebeb-479c-85ab-526f25482545';
+
+/** Status notification B (NOTIFY only). */
+const HL_NOTIFY_B_CHAR = 'ed5f901b-fb08-452c-8d01-46b6c9c1bcc5';
+
+/** Status notification C (NOTIFY only). */
+const HL_NOTIFY_C_CHAR = '80911332-ead5-4da0-9bfa-4d6286032e25';
+
+// ── Standard BLE Device Information Service (0x180A) ──
+// All chars confirmed readable without bond on HearLink 9050.
+
+const DIS_SERVICE = '0000180a-0000-1000-8000-00805f9b34fb';
+const DIS_MODEL_CHAR = '00002a24-0000-1000-8000-00805f9b34fb';
+const DIS_MANUFACTURER_CHAR = '00002a29-0000-1000-8000-00805f9b34fb';
+const DIS_FIRMWARE_CHAR = '00002a26-0000-1000-8000-00805f9b34fb';
+
+// ── Standard BLE Battery Service (0x180F) ──
+// Confirmed readable without bond on HearLink 9050 (returned 0x64 = 100%).
 
 const BATTERY_SERVICE = '0000180f-0000-1000-8000-00805f9b34fb';
 const BATTERY_LEVEL_CHAR = '00002a19-0000-1000-8000-00805f9b34fb';
@@ -142,6 +183,12 @@ export class PhilipsAdapter implements HearingAidAdapter {
   private deviceId: string | null = null;
   private lastKnownMute = false;
 
+  /** True when HearLink proprietary service (ba50125d) is used instead of POLARIS */
+  private useHearLink = false;
+
+  /** Subscription for HearLink command channel notifications (43c8465e) */
+  private hlCommandSub: Subscription | null = null;
+
   /** Cached volume ranges from device: [mainMin, mainMax, streamMin, streamMax, ...] */
   private volumeRanges: number[] | null = null;
 
@@ -163,20 +210,44 @@ export class PhilipsAdapter implements HearingAidAdapter {
 
     await this.device.discoverAllServicesAndCharacteristics();
 
-    // Read volume ranges so we can clamp writes to valid device limits
-    try {
-      const rangeChar = await withRetry(() =>
-        this.device!.readCharacteristicForService(POLARIS_SERVICE, VOLUME_RANGES_CHAR),
+    // Detect which proprietary service is available.
+    // HearLink 9050+ uses ba50125d; older models use POLARIS (56772eaf).
+    const services = await this.device.services();
+    const serviceUuids = services.map((s) => s.uuid.toLowerCase());
+    this.useHearLink = serviceUuids.some(
+      (u) => u.replace(/-/g, '') === HEARLINK_SERVICE.replace(/-/g, ''),
+    );
+
+    if (this.useHearLink) {
+      // Subscribe to HearLink command channel notifications for command responses
+      this.hlCommandSub = this.device.monitorCharacteristicForService(
+        HEARLINK_SERVICE,
+        HL_COMMAND_CHAR,
+        (_error, _char) => {
+          // Command response handler — captures acknowledge/state updates.
+          // TODO: Parse response payload once wire protocol is decoded.
+        },
       );
-      if (rangeChar.value) {
-        this.volumeRanges = base64ToBytes(rangeChar.value);
+    } else {
+      // POLARIS path: read volume ranges so we can clamp writes to valid device limits
+      try {
+        const rangeChar = await withRetry(() =>
+          this.device!.readCharacteristicForService(POLARIS_SERVICE, VOLUME_RANGES_CHAR),
+        );
+        if (rangeChar.value) {
+          this.volumeRanges = base64ToBytes(rangeChar.value);
+        }
+      } catch {
+        // Volume ranges char may not be present on all POLARIS firmware versions
       }
-    } catch {
-      // Volume ranges char may not be present on all POLARIS firmware versions
     }
   }
 
   async disconnect(): Promise<void> {
+    if (this.hlCommandSub) {
+      this.hlCommandSub.remove();
+      this.hlCommandSub = null;
+    }
     if (this.device) {
       try {
         await this.device.cancelConnection();
@@ -185,6 +256,7 @@ export class PhilipsAdapter implements HearingAidAdapter {
       }
       this.device = null;
       this.deviceId = null;
+      this.useHearLink = false;
     }
   }
 
@@ -202,26 +274,51 @@ export class PhilipsAdapter implements HearingAidAdapter {
 
   /**
    * Set main hearing aid volume.
-   * Writes [levelByte, invMuteByte] to main volume characteristic (1454e9d6).
-   * Per-ear control requires connecting to each device independently —
-   * the ear parameter is accepted for interface conformance only.
+   * POLARIS path: writes [levelByte, invMuteByte] to main volume char (1454e9d6).
+   * HearLink path: writes [levelByte, invMuteByte] to command char (43c8465e).
+   *   HearLink wire format is inferred from POLARIS pattern — not yet runtime-validated.
+   * Per-ear control requires connecting to each device independently.
    */
   async setVolume(level: number, _ear?: 'left' | 'right' | 'both'): Promise<void> {
     const dev = this.connected;
     const clamped = this.clampVolume(level, 'main');
     const muteFlag = this.lastKnownMute ? 0 : 1;
 
-    await withRetry(() =>
-      dev.writeCharacteristicWithoutResponseForService(
-        POLARIS_SERVICE,
-        MAIN_VOLUME_CHAR,
-        bytesToBase64([clamped, muteFlag]),
-      ),
-    );
+    if (this.useHearLink) {
+      // HearLink: use command channel. Format inferred — [level, muteFlag] per POLARIS pattern.
+      await withRetry(() =>
+        dev.writeCharacteristicWithResponseForService(
+          HEARLINK_SERVICE,
+          HL_COMMAND_CHAR,
+          bytesToBase64([clamped, muteFlag]),
+        ),
+      );
+    } else {
+      await withRetry(() =>
+        dev.writeCharacteristicWithoutResponseForService(
+          POLARIS_SERVICE,
+          MAIN_VOLUME_CHAR,
+          bytesToBase64([clamped, muteFlag]),
+        ),
+      );
+    }
   }
 
   async getVolume(): Promise<number> {
     const dev = this.connected;
+
+    if (this.useHearLink) {
+      // HearLink: read state char (e6c02a45). Bytes[8..10] appear to be volume levels
+      // based on probe data (all 0x80 = midpoint on fresh device).
+      const char = await withRetry(() =>
+        dev.readCharacteristicForService(HEARLINK_SERVICE, HL_STATE_CHAR),
+      );
+      if (!char.value) throw new Error('No value from HearLink state characteristic');
+      const bytes = base64ToBytes(char.value);
+      // byte[8] = main volume (inferred from probe: 0x80 = midpoint)
+      return bytes.length > 8 ? bytes[8] : 0;
+    }
+
     const char = await withRetry(() =>
       dev.readCharacteristicForService(POLARIS_SERVICE, MAIN_VOLUME_CHAR),
     );
@@ -234,8 +331,9 @@ export class PhilipsAdapter implements HearingAidAdapter {
   }
 
   /**
-   * Set mute state via main volume characteristic.
-   * byte1: 0 = muted, 1 = unmuted (confirmed via philips_uuid_dossier).
+   * Set mute state.
+   * POLARIS: byte1 of volume char — 0 = muted, 1 = unmuted (confirmed).
+   * HearLink: writes [currentLevel, muteFlag] to command char (inferred).
    */
   async setMute(muted: boolean): Promise<void> {
     const dev = this.connected;
@@ -248,17 +346,33 @@ export class PhilipsAdapter implements HearingAidAdapter {
     this.lastKnownMute = muted;
     const muteFlag = muted ? 0 : 1;
 
-    await withRetry(() =>
-      dev.writeCharacteristicWithoutResponseForService(
-        POLARIS_SERVICE,
-        MAIN_VOLUME_CHAR,
-        bytesToBase64([currentLevel, muteFlag]),
-      ),
-    );
+    if (this.useHearLink) {
+      await withRetry(() =>
+        dev.writeCharacteristicWithResponseForService(
+          HEARLINK_SERVICE,
+          HL_COMMAND_CHAR,
+          bytesToBase64([currentLevel, muteFlag]),
+        ),
+      );
+    } else {
+      await withRetry(() =>
+        dev.writeCharacteristicWithoutResponseForService(
+          POLARIS_SERVICE,
+          MAIN_VOLUME_CHAR,
+          bytesToBase64([currentLevel, muteFlag]),
+        ),
+      );
+    }
   }
 
   async getMute(): Promise<boolean> {
     const dev = this.connected;
+
+    if (this.useHearLink) {
+      // HearLink: mute state not yet mapped in state char — return tracked state
+      return this.lastKnownMute;
+    }
+
     const char = await withRetry(() =>
       dev.readCharacteristicForService(POLARIS_SERVICE, MAIN_VOLUME_CHAR),
     );
@@ -269,20 +383,46 @@ export class PhilipsAdapter implements HearingAidAdapter {
     return muted;
   }
 
-  /** Write [(byte) targetProgram] to program select characteristic (confirmed). */
+  /**
+   * Select program.
+   * POLARIS: write [(byte) targetProgram] to 535442f7 (confirmed).
+   * HearLink: write [(byte) programId] to command char 43c8465e (inferred).
+   *   The command char likely multiplexes volume and program commands;
+   *   the exact discriminator byte is TBD pending wire protocol decode.
+   */
   async setProgram(index: number): Promise<void> {
     const dev = this.connected;
-    await withRetry(() =>
-      dev.writeCharacteristicWithoutResponseForService(
-        POLARIS_SERVICE,
-        PROGRAM_SELECT_CHAR,
-        bytesToBase64([index & 0xff]),
-      ),
-    );
+
+    if (this.useHearLink) {
+      // HearLink: write program index to command channel.
+      // Single-byte write inferred from POLARIS pattern.
+      await withRetry(() =>
+        dev.writeCharacteristicWithResponseForService(
+          HEARLINK_SERVICE,
+          HL_COMMAND_CHAR,
+          bytesToBase64([index & 0xff]),
+        ),
+      );
+    } else {
+      await withRetry(() =>
+        dev.writeCharacteristicWithoutResponseForService(
+          POLARIS_SERVICE,
+          PROGRAM_SELECT_CHAR,
+          bytesToBase64([index & 0xff]),
+        ),
+      );
+    }
   }
 
   async getProgram(): Promise<number> {
     const dev = this.connected;
+
+    if (this.useHearLink) {
+      // HearLink: program index not yet mapped in state char — return 0 as default.
+      // TODO: Identify which byte in HL_STATE_CHAR encodes active program.
+      return 0;
+    }
+
     const char = await withRetry(() =>
       dev.readCharacteristicForService(POLARIS_SERVICE, PROGRAM_SELECT_CHAR),
     );
@@ -383,7 +523,7 @@ export class PhilipsAdapter implements HearingAidAdapter {
   /**
    * Read battery via standard BLE Battery Service (0x180F).
    * Returns 0-100 on success, -1 on failure.
-   * Philips HearLink uses the standard BAS (confirmed via dossier docs).
+   * Confirmed readable without bond on HearLink 9050 (probe returned 0x64 = 100%).
    */
   async getBattery(): Promise<number> {
     const dev = this.connected;
@@ -396,6 +536,33 @@ export class PhilipsAdapter implements HearingAidAdapter {
     } catch {
       return -1;
     }
+  }
+
+  /**
+   * Read device info via standard BLE Device Information Service (0x180A).
+   * All chars confirmed readable without bond on HearLink 9050:
+   *   Manufacturer: "SBO Hearing", Model: "HearLink 9050", FW: "rel_7.3_30.0"
+   */
+  async getDeviceInfo(): Promise<DeviceInfo> {
+    const dev = this.connected;
+    const info: DeviceInfo = {
+      id: this.deviceId!,
+      name: dev.name ?? 'Philips Hearing Aid',
+      brand: 'philips',
+    };
+
+    try {
+      const fwChar = await withRetry(() =>
+        dev.readCharacteristicForService(DIS_SERVICE, DIS_FIRMWARE_CHAR),
+      );
+      if (fwChar.value) {
+        info.firmwareVersion = String.fromCharCode(...base64ToBytes(fwChar.value));
+      }
+    } catch {
+      // DIS firmware char may not be readable on all models
+    }
+
+    return info;
   }
 
   /**
@@ -437,46 +604,47 @@ export class PhilipsAdapter implements HearingAidAdapter {
   async refreshState(): Promise<DriverState> {
     const dev = this.connected;
 
-    // Read main volume + mute from single characteristic
     let volume: number | undefined;
     let muted: boolean | undefined;
-    try {
-      const volChar = await withRetry(() =>
-        dev.readCharacteristicForService(POLARIS_SERVICE, MAIN_VOLUME_CHAR),
-      );
-      if (volChar.value) {
-        const bytes = base64ToBytes(volChar.value);
-        volume = bytes[0];
-        if (bytes.length >= 2) {
-          muted = bytes[1] === 0;
-          this.lastKnownMute = muted;
+
+    if (this.useHearLink) {
+      // HearLink: read state from e6c02a45. Bytes[8..10] inferred as volume levels.
+      try {
+        const stateChar = await withRetry(() =>
+          dev.readCharacteristicForService(HEARLINK_SERVICE, HL_STATE_CHAR),
+        );
+        if (stateChar.value) {
+          const bytes = base64ToBytes(stateChar.value);
+          volume = bytes.length > 8 ? bytes[8] : undefined;
         }
+      } catch {
+        // HearLink state read failed
       }
-    } catch {
-      // Main volume characteristic read failed
+      muted = this.lastKnownMute;
+    } else {
+      // POLARIS: read main volume + mute from single characteristic
+      try {
+        const volChar = await withRetry(() =>
+          dev.readCharacteristicForService(POLARIS_SERVICE, MAIN_VOLUME_CHAR),
+        );
+        if (volChar.value) {
+          const bytes = base64ToBytes(volChar.value);
+          volume = bytes[0];
+          if (bytes.length >= 2) {
+            muted = bytes[1] === 0;
+            this.lastKnownMute = muted;
+          }
+        }
+      } catch {
+        // Main volume characteristic read failed
+      }
     }
 
-    const [activeProgram, batteryPercent] = await Promise.all([
+    const [activeProgram, batteryPercent, deviceInfo] = await Promise.all([
       this.getProgram().catch(() => undefined),
       this.getBattery().catch(() => undefined),
+      this.getDeviceInfo().catch(() => undefined),
     ]);
-
-    let deviceInfo: DeviceInfo | undefined;
-    try {
-      const idChar = await withRetry(() =>
-        dev.readCharacteristicForService(POLARIS_SERVICE, DEVICE_ID_CHAR),
-      );
-      if (idChar.value) {
-        deviceInfo = {
-          id: this.deviceId!,
-          name: dev.name ?? 'Philips Hearing Aid',
-          brand: 'philips',
-          firmwareVersion: String.fromCharCode(...base64ToBytes(idChar.value)),
-        };
-      }
-    } catch {
-      // Device ID read failed
-    }
 
     return {
       volume,

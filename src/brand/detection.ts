@@ -72,13 +72,22 @@ export function detectBrandFromDiscovery(
     }
   }
 
-  // 4. Philips / Rexton — shared POLARIS service, differentiated by Terminal IO
+  // 4. Philips HearLink proprietary service (ba50125d) — newer HearLink 9050+ models.
+  //    Confirmed via live BLE probe on HearLink 9050 (FW rel_7.3_30.0).
+  if (hasService(normServices, 'ba50125d-0806-42ab-8bf1-22e0b954a8fa')) {
+    return 'philips';
+  }
+
+  // 5. Philips / Rexton — shared POLARIS service, differentiated by Terminal IO
   if (hasService(normServices, '56772eaf-2153-4f74-acf3-4368d99fbf5a')) {
     if (normServices.some((s) => s.startsWith('8b82'))) {
       return 'rexton';
     }
     return 'philips';
   }
+
+  // 6. Name-based fallback ("HearLink") is handled by inferBrandFromBluetoothName()
+  //    in scanner.ts — this function is UUID-only by design.
 
   return 'unknown';
 }
