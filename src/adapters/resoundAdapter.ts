@@ -1472,10 +1472,11 @@ export class ResoundAdapter implements HearingAidAdapter {
 
     let version = 0;
     let keyIndex = 0;
+    let capChar: { value: string | null } | undefined;
     const secCapKey = GN_SECURITY_CAP_CHAR.toLowerCase();
     if (this.charServiceMap.has(secCapKey)) {
       try {
-        const capChar = await withRetry(() =>
+        capChar = await withRetry(() =>
           this.connected.readCharacteristicForService(gnSvc, GN_SECURITY_CAP_CHAR),
         );
         if (capChar.value) {
@@ -1485,7 +1486,11 @@ export class ResoundAdapter implements HearingAidAdapter {
         }
       } catch { /* defaults */ }
     }
-    console.log('[Crypto Debug] Security cap — version:', version, 'keyIndex:', keyIndex);
+    const secCapAllBytes = capChar?.value ? Array.from(new Uint8Array(base64ToBytes(capChar.value))).map(b => '0x' + b.toString(16).padStart(2,'0')).join(' ') : 'not read';
+    const bondMethodByte = capChar?.value ? new Uint8Array(base64ToBytes(capChar.value))[4] : -1;
+    const bondMethodName = bondMethodByte === 1 ? 'Boot' : bondMethodByte === 2 ? 'Passcode' : bondMethodByte === 3 ? 'DFU' : `Unknown(${bondMethodByte})`;
+    console.log('[Crypto Debug] Security cap ALL bytes:', secCapAllBytes);
+    console.log('[Crypto Debug] Security cap — version:', version, 'keyIndex:', keyIndex, 'bondMethod:', bondMethodName);
     this.bondInfo.version = version;
     this.bondInfo.keyIndex = keyIndex;
 
@@ -1496,6 +1501,7 @@ export class ResoundAdapter implements HearingAidAdapter {
     if (!challengeChar.value) throw new Error('No challenge data');
     const challenge = new Uint8Array(base64ToBytes(challengeChar.value));
     console.log('[Crypto Debug] Challenge (hex):', Array.from(challenge).map(b => b.toString(16).padStart(2, '0')).join(' '), '(' + challenge.length + ' bytes)');
+    console.log('[Crypto Debug] Challenge byte[4] (bond method from sec cap):', bondMethodByte, bondMethodName);
 
     this.bondInfo.phase = 'reading_public_key';
     const hiPubKeyChar = await withRetry(() =>
