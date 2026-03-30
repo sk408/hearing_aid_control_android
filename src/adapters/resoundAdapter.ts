@@ -1485,6 +1485,7 @@ export class ResoundAdapter implements HearingAidAdapter {
         }
       } catch { /* defaults */ }
     }
+    console.log('[Crypto Debug] Security cap — version:', version, 'keyIndex:', keyIndex);
     this.bondInfo.version = version;
     this.bondInfo.keyIndex = keyIndex;
 
@@ -1494,6 +1495,7 @@ export class ResoundAdapter implements HearingAidAdapter {
     );
     if (!challengeChar.value) throw new Error('No challenge data');
     const challenge = new Uint8Array(base64ToBytes(challengeChar.value));
+    console.log('[Crypto Debug] Challenge (hex):', Array.from(challenge).map(b => b.toString(16).padStart(2, '0')).join(' '), '(' + challenge.length + ' bytes)');
 
     this.bondInfo.phase = 'reading_public_key';
     const hiPubKeyChar = await withRetry(() =>
@@ -1505,9 +1507,12 @@ export class ResoundAdapter implements HearingAidAdapter {
     this.bondInfo.phase = 'generating_keys';
     const handler = new P6TrustKeyHandler();
     handler.updateChallenge(challenge, version, keyIndex);
+    console.log('[Crypto Debug] updateChallenge done — commonSecret set');
     handler.setHIPublicKey(hiPublicKey);
+    console.log('[Crypto Debug] setHIPublicKey done');
     const aesEncoder = new AESDeEncoder();
     handler.generateKeys(aesEncoder);
+    console.log('[Crypto Debug] generateKeys done');
     this.trustKeyHandler = handler;
     return { handler, aesEncoder, keyIndex };
   }
@@ -1643,10 +1648,12 @@ export class ResoundAdapter implements HearingAidAdapter {
       // Stage 1: GenerateAuth type 1 — third byte is always 0 in CreateTrustedBondUsingBoot (C#)
       this.bondInfo.phase = 'writing_auth';
       const auth1 = handler.generateAuth(aesEncoder, BOND_TYPE_BOOT_STAGE1, 0);
+      console.log('[Crypto Debug] GenerateAuth payload (' + auth1.length + ' bytes):', Array.from(auth1).map(b => b.toString(16).padStart(2, '0')).join(' '));
 
       // Set up listener BEFORE writing (prevents race condition)
       const resp1Promise = this.awaitGnNotifyResponse(15000);
 
+      console.log('[Crypto Debug] Writing auth to GNTrustedAppChallenge...');
       await this.writeTrustedChallengeAuth(gnSvc, auth1);
 
       // Await response (may indicate reboot needed)
