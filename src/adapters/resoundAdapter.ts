@@ -67,6 +67,7 @@ import { P6TrustKeyHandler } from '../ble/gn/p6TrustKeyHandler';
 import {
   GN_TRUSTED_APP_CHALLENGE_CHAR,
   GN_HI_PUBLIC_KEY_CHAR,
+  GN_VERSION_CHAR,
   AUTH_HI_SAYS_HI,
   BOND_TYPE_BOOT_STAGE1,
   BOND_TYPE_BOOT_STAGE2,
@@ -1468,6 +1469,15 @@ export class ResoundAdapter implements HearingAidAdapter {
     aesEncoder: AESDeEncoder;
     keyIndex: number;
   }> {
+    try {
+      if (this.charServiceMap.has(GN_VERSION_CHAR.toLowerCase())) {
+        await this.connected.readCharacteristicForService(gnSvc, GN_VERSION_CHAR);
+        console.log('[Crypto Debug] GN version read OK');
+      }
+    } catch (e) {
+      console.log('[Crypto Debug] GN version read failed (continuing):', e);
+    }
+
     await this.gnSecurityCapPrimeWrite(gnSvc);
 
     let version = 0;
