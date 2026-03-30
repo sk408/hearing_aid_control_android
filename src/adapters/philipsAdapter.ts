@@ -25,6 +25,7 @@
  */
 import type { Device, Subscription } from 'react-native-ble-plx';
 import { getBleManager } from '../ble/BleManager';
+import { getBondState, createBond, BOND_BONDED } from '../ble/bleBond';
 import type { HearingAidAdapter, DriverState } from './types';
 import type { DeviceInfo, Feature, Program } from '../ble/types';
 
@@ -209,6 +210,18 @@ export class PhilipsAdapter implements HearingAidAdapter {
     );
 
     await this.device.discoverAllServicesAndCharacteristics();
+
+    // Ensure Android-level BLE bond before any secured characteristic access.
+    // Without this, writes to proprietary characteristics fail with
+    // "Operation was rejected" on Android 6+.
+    const bondState = await getBondState(deviceId);
+    if (bondState !== BOND_BONDED) {
+      console.log('[PhilipsAdapter] Initiating Android BLE bond...');
+      await createBond(deviceId);
+      console.log('[PhilipsAdapter] Android bond complete');
+    } else {
+      console.log('[PhilipsAdapter] Already Android-bonded');
+    }
 
     // Detect which proprietary service is available.
     // HearLink 9050+ uses ba50125d; older models use POLARIS (56772eaf).

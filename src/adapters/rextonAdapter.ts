@@ -41,6 +41,7 @@
  */
 import type { Device, Subscription } from 'react-native-ble-plx';
 import { getBleManager } from '../ble/BleManager';
+import { getBondState, createBond, BOND_BONDED } from '../ble/bleBond';
 import type { HearingAidAdapter, DriverState } from './types';
 import type { DeviceInfo, Feature, Program } from '../ble/types';
 
@@ -218,6 +219,18 @@ export class RextonAdapter implements HearingAidAdapter {
     );
 
     await this.device.discoverAllServicesAndCharacteristics();
+
+    // Ensure Android-level BLE bond before any secured characteristic access.
+    // Without this, writes to Terminal IO / POLARIS characteristics fail with
+    // "Operation was rejected" on Android 6+.
+    const bondState = await getBondState(deviceId);
+    if (bondState !== BOND_BONDED) {
+      console.log('[RextonAdapter] Initiating Android BLE bond...');
+      await createBond(deviceId);
+      console.log('[RextonAdapter] Android bond complete');
+    } else {
+      console.log('[RextonAdapter] Already Android-bonded');
+    }
 
     // Subscribe to program change notifications
     this.programNotifySub = this.device.monitorCharacteristicForService(
