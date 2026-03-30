@@ -1428,40 +1428,68 @@ export class ResoundAdapter implements HearingAidAdapter {
       // Check for reboot indicator (0x13 = HI will reboot)
       let gnSvc2 = gnSvc;
       if (resp1[1] === 0x13) {
-        this.onRebootRequired?.(
-          'Please reboot your hearing aid now (open/close the battery door or place in charger) to complete pairing.',
-        );
-        console.log('[ResoundAdapter] Waiting for user to reboot HI...');
-        this.bondInfo.phase = 'awaiting_reboot';
-        const manager = getBleManager();
+        try {
+          this.onRebootRequired?.(
+            'Please reboot your hearing aid now (open/close the battery door or place in charger) to complete pairing.',
+          );
+          console.log('[ResoundAdapter] Waiting for user to reboot HI...');
+          this.bondInfo.phase = 'awaiting_reboot';
+          const manager = getBleManager();
 
-        // Wait for disconnect
-        await new Promise<void>((resolve) => {
-          const sub = manager.onDeviceDisconnected(this.deviceId!, () => {
-            sub.remove();
-            resolve();
-          });
-          setTimeout(() => { sub.remove(); resolve(); }, 10000); // timeout fallback
-        });
+          // Wait for disconnect — ignore BLE cancellation errors (expected when device reboots)
+          await new Promise<void>((resolve) => {
+            let resolved = false;
+            const finish = () => { if (!resolved) { resolved = true; resolve(); } };
 
-        // Wait for reconnect
-        let reconnected = false;
-        for (let i = 0; i < 30; i++) {
-          await new Promise(r => setTimeout(r, 2000));
+            const sub = manager.onDeviceDisconnected(this.deviceId!, () => {
+              sub.remove();
+              finish();
+            });
+            setTimeout(() => { try { sub.remove(); } catch {} finish(); }, 15000);
+          }).catch(() => {}); // swallow any errors during disconnect
+
+          // Small additional wait to let the device fully power cycle
+          await new Promise(r => setTimeout(r, 3000));
+
+          // Wait for reconnect
+          let reconnected = false;
+          for (let i = 0; i < 30; i++) {
+            await new Promise(r => setTimeout(r, 2000));
+            try {
+              const connected = await manager.isDeviceConnected(this.deviceId!);
+              if (connected) { reconnected = true; break; }
+            } catch (e) {
+              // Device not available yet, keep waiting
+              console.log(`[ResoundAdapter] Still waiting for HI reconnect... (${i + 1}/30)`);
+            }
+          }
+          if (!reconnected) throw new Error('HI did not reconnect after reboot');
+
+          // Re-establish services
+          this.device = await manager.connectToDevice(this.deviceId!, { requestMTU: 512 });
+          await this.device.discoverAllServicesAndCharacteristics();
+          await this.buildCharacteristicMap();
+          await this.setupGnNotify();
+          gnSvc2 = this.resolveGnService();
+          console.log('[ResoundAdapter] Reconnected after HI reboot');
+        } catch (rebootErr) {
+          // If we get here due to BLE cancellation during disconnect,
+          // check if device eventually reconnected
+          console.log('[ResoundAdapter] Reboot phase error (may be normal):', rebootErr);
+          // Wait a bit then try to reconnect anyway
+          await new Promise(r => setTimeout(r, 5000));
           try {
-            const connected = await manager.isDeviceConnected(this.deviceId!);
-            if (connected) { reconnected = true; break; }
-          } catch { /* device not available yet */ }
+            const manager = getBleManager();
+            this.device = await manager.connectToDevice(this.deviceId!, { requestMTU: 512 });
+            await this.device.discoverAllServicesAndCharacteristics();
+            await this.buildCharacteristicMap();
+            await this.setupGnNotify();
+            gnSvc2 = this.resolveGnService();
+            console.log('[ResoundAdapter] Reconnected after HI reboot (fallback path)');
+          } catch (reconnectErr) {
+            throw new Error('HI did not reconnect after reboot: ' + reconnectErr);
+          }
         }
-        if (!reconnected) throw new Error('HI did not reconnect after reboot');
-
-        // Re-establish services
-        this.device = await manager.connectToDevice(this.deviceId!, { requestMTU: 512 });
-        await this.device.discoverAllServicesAndCharacteristics();
-        await this.buildCharacteristicMap();
-        await this.setupGnNotify();
-        gnSvc2 = this.resolveGnService();
-        console.log('[ResoundAdapter] Reconnected after HI reboot');
       }
 
       // Stage 2: GenerateAuth type 2
