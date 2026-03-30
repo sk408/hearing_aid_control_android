@@ -17,20 +17,32 @@
  *   4. GenerateKeys(encoder)                      → appSession, hiSession, sharedAppKey
  *   5. GenerateAuth(connectType, sharedAppIndex)  → auth bytes for GNTrustedAppChallenge
  *
- * NOTE: react-native-quick-crypto must be installed.
+ * NOTE: Uses @noble/curves for ECDH and @noble/hashes for SHA-256 instead of
+ * react-native-quick-crypto, because RN Hermes doesn't support the crypto
+ * native module's createECDH reliably.
  */
 
-import Crypto from 'react-native-quick-crypto';
+import { p256 } from '@noble/curves/p256';
+import { sha256 as nobleSha256 } from '@noble/hashes/sha256';
 import { AESDeEncoder, getAppBaseKey } from './aesDeEncoder';
 import { AUTH_APP_SAYS_HI } from './gnConstants';
 
+/** Concatenate multiple Uint8Arrays into one */
+function concat(...parts: Uint8Array[]): Uint8Array {
+  let totalLength = 0;
+  for (const part of parts) totalLength += part.length;
+  const result = new Uint8Array(totalLength);
+  let offset = 0;
+  for (const part of parts) {
+    result.set(part, offset);
+    offset += part.length;
+  }
+  return result;
+}
+
 /** SHA-256 hash of concatenated buffers */
 function sha256(...parts: Uint8Array[]): Uint8Array {
-  const hash = Crypto.createHash('sha256');
-  for (const part of parts) {
-    hash.update(part);
-  }
-  return new Uint8Array(hash.digest());
+  return nobleSha256(concat(...parts));
 }
 
 /** Convert a string to UTF-8 bytes (manual — avoids TextEncoder dependency) */
@@ -105,18 +117,18 @@ export class P6TrustKeyHandler {
    */
   setHIPublicKey(hiPublicKeyBytes: Uint8Array): void {
     // Generate ephemeral P-256 key pair
-    const ecdh = Crypto.createECDH('prime256v1');
-    ecdh.generateKeys();
+    const appPrivateKey = p256.utils.randomPrivateKey();
+    const appPublicKey = p256.getPublicKey(appPrivateKey, false); // uncompressed, 65 bytes
 
-    this.appPrivateKey = new Uint8Array(ecdh.getPrivateKey());
-    // Full uncompressed public key (0x04 || X || Y) — 65 bytes
-    this.appPublicKey = new Uint8Array(ecdh.getPublicKey());
+    this.appPrivateKey = appPrivateKey;
+    this.appPublicKey = appPublicKey;
 
-    // Compute ECDH shared secret
-    const dhkey = new Uint8Array(ecdh.computeSecret(hiPublicKeyBytes));
+    // ECDH: compute shared point, take X coordinate as shared secret
+    const sharedPoint = p256.getSharedSecret(appPrivateKey, hiPublicKeyBytes);
+    const dhkey = sharedPoint.slice(1, 33); // X coordinate only (skip 0x04 prefix)
 
     // Mix into common secret
-    this.commonSecret = sha256(this.commonSecret, dhkey);
+    this.commonSecret = sha256(this.commonSecret, new Uint8Array(dhkey));
   }
 
   /**

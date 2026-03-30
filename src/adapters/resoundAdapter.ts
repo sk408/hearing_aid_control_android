@@ -250,23 +250,24 @@ export class ResoundAdapter implements HearingAidAdapter {
 
     await this.setupGnNotify();
 
+    // Wait for Android BLE bond to complete before attempting GN trust
+    await new Promise(resolve => setTimeout(resolve, 2000)); // allow bond to settle
+
     // GN application-level trust handshake (required for volume/program control)
     try {
       const stored = loadBondData(this.deviceId);
       if (stored) {
-        // Reconnect path: use stored shared app secret
         const bonded = await this.establishTrustedBond();
         if (!bonded) {
           console.log('[ResoundAdapter] Reconnect bond failed, trying boot bond...');
           await this.createTrustedBondBoot();
         }
       } else {
-        // First time: full boot bond
         console.log('[ResoundAdapter] No stored bond — starting boot bond...');
         await this.createTrustedBondBoot();
       }
     } catch (e) {
-      console.warn('[ResoundAdapter] Trust handshake failed (will use plaintext):', e);
+      console.warn('[ResoundAdapter] Trust handshake failed (plaintext fallback):', e);
     }
   }
 
