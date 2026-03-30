@@ -1664,15 +1664,11 @@ export class ResoundAdapter implements HearingAidAdapter {
       }
       console.log('[ResoundAdapter] Stage 1 response:', resp1.map(b => '0x' + b.toString(16).padStart(2, '0')).join(' '));
 
-      /**
-       * 0x15 (21) = HIWaitsForReboot in BLE.dll → tbi.SharedAppSecret for SetSharedAppKey path.
-       * 0x13 (19) = AuthNotAccepted in DLL but some firmware reboots anyway → full ECDH after reconnect.
-       */
-      // Both 0x15 (HIWaitsForReboot) and 0x13 (AuthNotAccepted/reboot hint) use
-      // the SetSharedAppKey path after reconnect — confirmed by live device behavior.
-      const useSharedKeyAfterReboot = resp1[1] === AUTH_HI_WAITS_FOR_REBOOT || resp1[1] === AUTH_FW_REBOOT_HINT;
-      const useFullEcdhAfterReboot = false; // retired — 0x13 also uses SetSharedAppKey
-      const needRebootWait = useSharedKeyAfterReboot || useFullEcdhAfterReboot;
+      // 0x15 (21) = HIWaitsForReboot in BLE.dll → SetSharedAppKey path after reconnect
+      // 0x13 (19) = AuthNotAccepted/Credentials rejected → assertNoFatalBondAuthStatus will throw
+      const useSharedKeyAfterReboot = resp1[1] === AUTH_HI_WAITS_FOR_REBOOT; // 0x15 ONLY
+      const useFullEcdhAfterReboot = false;
+      const needRebootWait = useSharedKeyAfterReboot;
 
       if (!needRebootWait) {
         this.assertNoFatalBondAuthStatus('Boot stage 1', resp1, BOND_ACK_INTERIM_STATUSES);
