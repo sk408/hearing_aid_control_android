@@ -80,6 +80,7 @@ import {
   createInitialBondInfo,
   storeBondData,
   loadBondData,
+  restorePersistedBonds,
   parseSecurityCap,
   uint8ToBase64,
   base64ToUint8,
@@ -244,6 +245,7 @@ export class ResoundAdapter implements HearingAidAdapter {
   // ── Connection ──
 
   async connect(deviceId: string): Promise<void> {
+    await restorePersistedBonds(); // ensure persisted bonds are in cache
     selfTestAES();
     const manager = getBleManager();
     this.deviceId = deviceId;

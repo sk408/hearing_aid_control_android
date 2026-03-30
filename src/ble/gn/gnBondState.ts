@@ -1,3 +1,5 @@
+import AsyncStorage from '@react-native-async-storage/async-storage';
+
 /**
  * GN bond state machine types + persistence helpers.
  *
@@ -65,14 +67,19 @@ export function createInitialBondInfo(): GnBondInfo {
   };
 }
 
-// ── In-memory bond data cache ──
-// For production, replace with secure persistent storage (e.g. Keychain).
+// ── Bond data persistence (AsyncStorage + in-memory cache) ──
 
+const BOND_STORAGE_PREFIX = 'gn_bond_';
+
+// Keep in-memory cache for fast sync access during a session
 const bondCache = new Map<string, StoredBondData>();
 
 /** Store bond data for reconnect (EstablishTrustedBond). */
 export function storeBondData(data: StoredBondData): void {
   bondCache.set(data.deviceId, data);
+  // Also persist to storage asynchronously
+  AsyncStorage.setItem(BOND_STORAGE_PREFIX + data.deviceId, JSON.stringify(data))
+    .catch(e => console.warn('[GnBondState] Failed to persist bond data:', e));
   console.log('[GnBondState] Bond data stored for', data.deviceId);
 }
 
@@ -81,9 +88,32 @@ export function loadBondData(deviceId: string): StoredBondData | null {
   return bondCache.get(deviceId) ?? null;
 }
 
+/** Call once at app startup to restore persisted bonds into the in-memory cache. */
+export async function restorePersistedBonds(): Promise<void> {
+  try {
+    const keys = await AsyncStorage.getAllKeys();
+    const bondKeys = keys.filter(k => k.startsWith(BOND_STORAGE_PREFIX));
+    if (bondKeys.length === 0) return;
+    const pairs = await AsyncStorage.multiGet(bondKeys);
+    for (const [key, value] of pairs) {
+      if (value) {
+        try {
+          const data: StoredBondData = JSON.parse(value);
+          bondCache.set(data.deviceId, data);
+          console.log('[GnBondState] Restored bond for', data.deviceId);
+        } catch {}
+      }
+    }
+  } catch (e) {
+    console.warn('[GnBondState] Failed to restore bond data:', e);
+  }
+}
+
 /** Remove stored bond data for a device. */
 export function clearBondData(deviceId: string): void {
   bondCache.delete(deviceId);
+  AsyncStorage.removeItem(BOND_STORAGE_PREFIX + deviceId)
+    .catch(() => {});
   console.log('[GnBondState] Bond data cleared for', deviceId);
 }
 

@@ -2,9 +2,10 @@
  * Hearing Aid Controller — React Native Android App
  * Entry point with navigation setup.
  */
-import React from 'react';
+import React, { useEffect } from 'react';
 import { StatusBar, useColorScheme } from 'react-native';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
+import { restorePersistedBonds } from './src/ble/gn/gnBondState';
 import { NavigationContainer } from '@react-navigation/native';
 import { createStackNavigator } from '@react-navigation/stack';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
@@ -23,6 +24,10 @@ const Stack = createStackNavigator<RootStackParamList>();
 
 function App(): React.JSX.Element {
   const isDarkMode = useColorScheme() === 'dark';
+
+  useEffect(() => {
+    restorePersistedBonds();
+  }, []);
 
   return (
     <GestureHandlerRootView style={{ flex: 1 }}>
