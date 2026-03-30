@@ -116,6 +116,25 @@ export class P6TrustKeyHandler {
    *   3. commonSecret = SHA256(commonSecret || dhkey).
    */
   setHIPublicKey(hiPublicKeyBytes: Uint8Array): void {
+    console.log('[P6TrustKeyHandler] HI public key raw:', Array.from(hiPublicKeyBytes).map(b => b.toString(16).padStart(2,'0')).join(' '), `(${hiPublicKeyBytes.length} bytes)`);
+
+    // Normalize to uncompressed format (0x04 || X || Y) which noble/curves requires
+    let pubKeyForECDH: Uint8Array;
+    if (hiPublicKeyBytes.length === 64) {
+      // Raw X||Y — prepend 0x04
+      pubKeyForECDH = new Uint8Array(65);
+      pubKeyForECDH[0] = 0x04;
+      pubKeyForECDH.set(hiPublicKeyBytes, 1);
+    } else if (hiPublicKeyBytes.length === 65 && hiPublicKeyBytes[0] === 0x04) {
+      // Already uncompressed
+      pubKeyForECDH = hiPublicKeyBytes;
+    } else if (hiPublicKeyBytes.length === 33 && (hiPublicKeyBytes[0] === 0x02 || hiPublicKeyBytes[0] === 0x03)) {
+      // Compressed — noble handles this fine
+      pubKeyForECDH = hiPublicKeyBytes;
+    } else {
+      throw new Error(`Unexpected HI public key format: ${hiPublicKeyBytes.length} bytes, first byte 0x${hiPublicKeyBytes[0]?.toString(16)}`);
+    }
+
     // Generate ephemeral P-256 key pair
     const appPrivateKey = p256.utils.randomPrivateKey();
     const appPublicKey = p256.getPublicKey(appPrivateKey, false); // uncompressed, 65 bytes
@@ -124,7 +143,7 @@ export class P6TrustKeyHandler {
     this.appPublicKey = appPublicKey;
 
     // ECDH: compute shared point, take X coordinate as shared secret
-    const sharedPoint = p256.getSharedSecret(appPrivateKey, hiPublicKeyBytes);
+    const sharedPoint = p256.getSharedSecret(appPrivateKey, pubKeyForECDH);
     const dhkey = sharedPoint.slice(1, 33); // X coordinate only (skip 0x04 prefix)
 
     // Mix into common secret
