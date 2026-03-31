@@ -96,8 +96,21 @@ const HI_STATE_CHAR = '83e28ff3-25ad-4bfe-aaf0-5a95dba4b56b';
 /** Ear side identifier (partial) */
 const EAR_CHAR = 'd28617fe-0ad5-40c5-a04a-bc89051ff755';
 
-/** ASHA volume fallback — signed int8 [-128..0] (confirmed) */
-const ASHA_VOLUME_CHAR = '00e4ca9e-ab14-41e4-8823-f9e70c7e91df';
+/**
+ * Shared POLARIS main volume char (same UUID as Philips 1454e9d6).
+ * Format: [level, invMute] where invMute: 1=unmuted, 0=muted.
+ * Rexton firmware exposes this on the shared POLARIS service (56772eaf)
+ * alongside the Terminal IO Basic Control path.
+ * Used for reading current volume state (notify/read).
+ */
+const MAIN_VOLUME_CHAR = '1454e9d6-f658-4190-8589-22aa9e3021eb';
+
+/**
+ * Shared POLARIS program select char (same UUID as Philips 535442f7).
+ * Write [(byte) programId], notify returns active program index.
+ * Alternative to Terminal IO Basic Control [0x05, prog] for program switching.
+ */
+const POLARIS_PROGRAM_CHAR = '535442f7-0ff7-4fec-9780-742f3eb00eda';
 
 // ── Bonding service (0a23ae62 — same UUID as Philips ASHA bonding) ──
 // Live probe: most characteristics reject reads without bonding.
@@ -201,6 +214,7 @@ export class RextonAdapter implements HearingAidAdapter {
   private lastKnownMute = false;
   private lastKnownProgram = 0;
   private programNotifySub: Subscription | null = null;
+  private volumeNotifySub: Subscription | null = null;
 
   /** Returns connected device or throws */
   private get connected(): Device {
@@ -213,12 +227,15 @@ export class RextonAdapter implements HearingAidAdapter {
   async connect(deviceId: string): Promise<void> {
     const manager = getBleManager();
     this.deviceId = deviceId;
+    console.log(`[RextonAdapter] Connecting to ${deviceId}...`);
 
     this.device = await withRetry(() =>
       manager.connectToDevice(deviceId, { requestMTU: 512 }),
     );
+    console.log('[RextonAdapter] GATT connected, discovering services...');
 
     await this.device.discoverAllServicesAndCharacteristics();
+    console.log('[RextonAdapter] Service discovery complete');
 
     // Ensure Android-level BLE bond before any secured characteristic access.
     // Without this, writes to Terminal IO / POLARIS characteristics fail with
@@ -232,24 +249,62 @@ export class RextonAdapter implements HearingAidAdapter {
       console.log('[RextonAdapter] Already Android-bonded');
     }
 
-    // Subscribe to program change notifications
+    // Subscribe to Terminal IO program change notifications (8b8225e0)
     this.programNotifySub = this.device.monitorCharacteristicForService(
       TERMINAL_IO_SERVICE,
       PROGRAM_NOTIFY_CHAR,
       (error, char) => {
-        if (error || !char?.value) return;
+        if (error) {
+          console.log('[RextonAdapter] Program notify error:', error.message);
+          return;
+        }
+        if (!char?.value) return;
         const bytes = base64ToBytes(char.value);
         if (bytes.length >= 1) {
           this.lastKnownProgram = bytes[0];
+          console.log(`[RextonAdapter] Program notify: program=${bytes[0]}`);
         }
       },
     );
+
+    // Subscribe to shared POLARIS main volume char (1454e9d6) for volume state tracking.
+    // Rexton shares this UUID with Philips/Oticon on the POLARIS service.
+    // Format: [level, invMute] where invMute 1=unmuted, 0=muted.
+    try {
+      this.volumeNotifySub = this.device.monitorCharacteristicForService(
+        POLARIS_SERVICE,
+        MAIN_VOLUME_CHAR,
+        (error, char) => {
+          if (error || !char?.value) return;
+          const bytes = base64ToBytes(char.value);
+          if (bytes.length >= 1) {
+            this.lastKnownVolume = bytes[0];
+            console.log(`[RextonAdapter] Volume notify: level=${bytes[0]}${bytes.length >= 2 ? `, mute=${bytes[1] === 0}` : ''}`);
+          }
+          if (bytes.length >= 2) {
+            this.lastKnownMute = bytes[1] === 0;
+          }
+        },
+      );
+      console.log('[RextonAdapter] Subscribed to POLARIS volume notifications');
+    } catch {
+      // POLARIS main volume char may not be available on all Rexton firmware versions.
+      // Volume tracking will rely on lastKnownVolume from setVolume() calls.
+      console.log('[RextonAdapter] POLARIS volume subscription not available — using local tracking');
+    }
+
+    console.log('[RextonAdapter] Connection setup complete');
   }
 
   async disconnect(): Promise<void> {
+    console.log('[RextonAdapter] Disconnecting...');
     if (this.programNotifySub) {
       this.programNotifySub.remove();
       this.programNotifySub = null;
+    }
+    if (this.volumeNotifySub) {
+      this.volumeNotifySub.remove();
+      this.volumeNotifySub = null;
     }
     if (this.device) {
       try {
@@ -260,11 +315,13 @@ export class RextonAdapter implements HearingAidAdapter {
       this.device = null;
       this.deviceId = null;
     }
+    console.log('[RextonAdapter] Disconnected');
   }
 
-  /** Write [opcode, value] to Terminal IO Basic Control characteristic */
+  /** Write [opcode, value] to Terminal IO Basic Control characteristic (8b8276e8) */
   private async writeBasicControl(opcode: number, value: number): Promise<void> {
     const dev = this.connected;
+    console.log(`[RextonAdapter] BasicControl write: [0x${opcode.toString(16).padStart(2, '0')}, ${value}]`);
     await withRetry(() =>
       dev.writeCharacteristicWithResponseForService(
         TERMINAL_IO_SERVICE,
@@ -282,29 +339,39 @@ export class RextonAdapter implements HearingAidAdapter {
    */
   async setVolume(level: number, _ear?: 'left' | 'right' | 'both'): Promise<void> {
     const clamped = Math.max(0, Math.min(255, Math.round(level)));
+    console.log(`[RextonAdapter] setVolume(${clamped})`);
     await this.writeBasicControl(OP_VOLUME, clamped);
     this.lastKnownVolume = clamped;
   }
 
   /**
    * Read current volume.
-   * Terminal IO Basic Control is write-only for individual opcodes;
-   * fall back to reading the POLARIS volume characteristic.
+   * Terminal IO Basic Control is write-only; reads use the shared POLARIS
+   * main volume char (1454e9d6) which returns [level, invMute].
+   * Falls back to lastKnownVolume tracked from setVolume() calls and
+   * POLARIS volume notifications.
    */
   async getVolume(): Promise<number> {
     const dev = this.connected;
     try {
       const char = await withRetry(() =>
-        dev.readCharacteristicForService(POLARIS_SERVICE, ASHA_VOLUME_CHAR),
+        dev.readCharacteristicForService(POLARIS_SERVICE, MAIN_VOLUME_CHAR),
       );
       if (char.value) {
         const bytes = base64ToBytes(char.value);
-        // ASHA: signed int8 [-128..0], map to 0..128
-        const signed = bytes[0] > 127 ? bytes[0] - 256 : bytes[0];
-        return signed + 128;
+        if (bytes.length >= 1) {
+          this.lastKnownVolume = bytes[0];
+        }
+        if (bytes.length >= 2) {
+          this.lastKnownMute = bytes[1] === 0;
+        }
+        console.log(`[RextonAdapter] Read POLARIS volume: level=${bytes[0]}${bytes.length >= 2 ? `, mute=${bytes[1] === 0}` : ''}`);
+        return bytes[0];
       }
     } catch {
-      // ASHA volume read unavailable
+      // POLARIS main volume char may not be readable on all Rexton firmware.
+      // Fall back to lastKnownVolume from writes / notifications.
+      console.log('[RextonAdapter] POLARIS volume read unavailable, using lastKnownVolume');
     }
     return this.lastKnownVolume;
   }
@@ -316,6 +383,7 @@ export class RextonAdapter implements HearingAidAdapter {
    * paths). Using volume-minimum emulation as fallback.
    */
   async setMute(muted: boolean): Promise<void> {
+    console.log(`[RextonAdapter] setMute(${muted})`);
     this.lastKnownMute = muted;
     if (muted) {
       // Fallback: set volume to 0 (minimum) to emulate mute
@@ -334,6 +402,7 @@ export class RextonAdapter implements HearingAidAdapter {
 
   /** Write [0x05, program_index] to Terminal IO Basic Control (confirmed). */
   async setProgram(index: number): Promise<void> {
+    console.log(`[RextonAdapter] setProgram(${index})`);
     await this.writeBasicControl(OP_PROGRAM, index);
     this.lastKnownProgram = index;
   }
@@ -375,8 +444,11 @@ export class RextonAdapter implements HearingAidAdapter {
         dev.readCharacteristicForService(BATTERY_SERVICE, BATTERY_LEVEL_CHAR),
       );
       if (!char.value) return -1;
-      return base64ToBytes(char.value)[0]; // BAS: single byte 0-100
+      const level = base64ToBytes(char.value)[0]; // BAS: single byte 0-100
+      console.log(`[RextonAdapter] Battery: ${level}%`);
+      return level;
     } catch {
+      console.log('[RextonAdapter] Battery read failed');
       return -1;
     }
   }
@@ -425,12 +497,14 @@ export class RextonAdapter implements HearingAidAdapter {
   /** Write [0x06, value] to Terminal IO Basic Control (confirmed). */
   async setBalance(value: number): Promise<void> {
     const clamped = Math.max(0, Math.min(255, Math.round(value) & 0xff));
+    console.log(`[RextonAdapter] setBalance(${clamped})`);
     await this.writeBasicControl(OP_BALANCE, clamped);
   }
 
   /** Write [0x07, value] to Terminal IO Basic Control (confirmed). */
   async setTinnitusVolume(level: number): Promise<void> {
     const clamped = Math.max(0, Math.min(255, Math.round(level)));
+    console.log(`[RextonAdapter] setTinnitusVolume(${clamped})`);
     await this.writeBasicControl(OP_TINNITUS, clamped);
   }
 
@@ -442,6 +516,7 @@ export class RextonAdapter implements HearingAidAdapter {
   async setStreamingVolume(level: number): Promise<void> {
     const dev = this.connected;
     const clamped = Math.max(0, Math.min(255, Math.round(level)));
+    console.log(`[RextonAdapter] setStreamingVolume(${clamped})`);
     const payload = clamped > 0 ? [clamped - 1, 0x01] : [0x00, 0x00];
     await withRetry(() =>
       dev.writeCharacteristicWithoutResponseForService(
