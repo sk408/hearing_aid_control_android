@@ -4,7 +4,7 @@
  * Supports two proprietary service paths:
  *
  * 1. POLARIS service (56772eaf) — older/current generation (Oticon/Demant stack)
- *    Volume channels (all 2-byte: [level, invMute] where 1=unmuted, 0=muted):
+ *    Volume channels (all 4-byte: UINT16 level LE + UINT16 mute LE, 0=muted):
  *      Main volume:     1454e9d6  (write-no-response)
  *      Streaming volume: 50632720 (write-no-response)
  *      Tinnitus/mic:    e5892ebe  (write-no-response)
@@ -32,6 +32,8 @@ import type { DeviceInfo, Feature, Program } from '../ble/types';
 // ── POLARIS characteristic UUIDs (from philips_uuid_dossier docs) ──
 
 const POLARIS_SERVICE = '56772eaf-2153-4f74-acf3-4368d99fbf5a';
+const SECONDARY_SERVICE = '14293049-77d7-4244-ae6a-d3873e4a3184';
+const SCAN_FILTER_SERVICE = '7d74f4bd-c74a-4431-862c-cce884371592';
 
 // ── Volume characteristics — all use 2-byte format [level, invMute] ──
 
@@ -215,7 +217,7 @@ export class PhilipsAdapter implements HearingAidAdapter {
     console.log(`[PhilipsAdapter] Connecting to ${deviceId}...`);
 
     this.device = await withRetry(() =>
-      manager.connectToDevice(deviceId, { requestMTU: 512 }),
+      manager.connectToDevice(deviceId, { requestMTU: 255 }),
     );
     console.log('[PhilipsAdapter] GATT connected, discovering services...');
 
@@ -267,7 +269,13 @@ export class PhilipsAdapter implements HearingAidAdapter {
           this.device!.readCharacteristicForService(POLARIS_SERVICE, VOLUME_RANGES_CHAR),
         );
         if (rangeChar.value) {
-          this.volumeRanges = base64ToBytes(rangeChar.value);
+          const rawBytes = base64ToBytes(rangeChar.value);
+          // Parse as UINT16 LE pairs: [mainMin, mainMax, streamMin, streamMax, ...]
+          const ranges: number[] = [];
+          for (let i = 0; i + 1 < rawBytes.length; i += 2) {
+            ranges.push(rawBytes[i] | (rawBytes[i + 1] << 8));
+          }
+          this.volumeRanges = ranges;
           console.log(`[PhilipsAdapter] Volume ranges: [${this.volumeRanges.join(', ')}]`);
         }
       } catch {
@@ -283,13 +291,13 @@ export class PhilipsAdapter implements HearingAidAdapter {
           (error, char) => {
             if (error || !char?.value) return;
             const bytes = base64ToBytes(char.value);
-            if (bytes.length >= 1) {
-              this.lastKnownVolume = bytes[0];
-            }
             if (bytes.length >= 2) {
-              this.lastKnownMute = bytes[1] === 0;
+              this.lastKnownVolume = bytes[0] | (bytes[1] << 8);
             }
-            console.log(`[PhilipsAdapter] Volume notify: level=${bytes[0]}${bytes.length >= 2 ? `, mute=${bytes[1] === 0}` : ''}`);
+            if (bytes.length >= 4) {
+              this.lastKnownMute = (bytes[2] | (bytes[3] << 8)) === 0;
+            }
+            console.log(`[PhilipsAdapter] Volume notify: level=${this.lastKnownVolume}, mute=${this.lastKnownMute}`);
           },
         );
         console.log('[PhilipsAdapter] Subscribed to POLARIS volume notifications');
@@ -315,6 +323,43 @@ export class PhilipsAdapter implements HearingAidAdapter {
         console.log('[PhilipsAdapter] Subscribed to POLARIS program notifications');
       } catch {
         console.log('[PhilipsAdapter] POLARIS program subscription not available');
+      }
+
+      // Subscribe to volume ranges (58bbccc5) for limit updates
+      try {
+        this.device.monitorCharacteristicForService(
+          POLARIS_SERVICE,
+          VOLUME_RANGES_CHAR,
+          (error, char) => {
+            if (error || !char?.value) return;
+            const rawBytes = base64ToBytes(char.value);
+            const ranges: number[] = [];
+            for (let i = 0; i + 1 < rawBytes.length; i += 2) {
+              ranges.push(rawBytes[i] | (rawBytes[i + 1] << 8));
+            }
+            this.volumeRanges = ranges;
+            console.log(`[PhilipsAdapter] Volume ranges notify: [${ranges.join(', ')}]`);
+          },
+        );
+        console.log('[PhilipsAdapter] Subscribed to POLARIS volume ranges notifications');
+      } catch {
+        console.log('[PhilipsAdapter] POLARIS volume ranges subscription not available');
+      }
+
+      // Subscribe to streaming volume (50632720) for state tracking
+      try {
+        this.device.monitorCharacteristicForService(
+          POLARIS_SERVICE,
+          STREAMING_VOLUME_CHAR,
+          (error, char) => {
+            if (error || !char?.value) return;
+            const bytes = base64ToBytes(char.value);
+            console.log(`[PhilipsAdapter] Streaming volume notify: [${bytes.map(b => '0x' + b.toString(16).padStart(2, '0')).join(', ')}]`);
+          },
+        );
+        console.log('[PhilipsAdapter] Subscribed to POLARIS streaming volume notifications');
+      } catch {
+        console.log('[PhilipsAdapter] POLARIS streaming volume subscription not available');
       }
     }
 
@@ -348,11 +393,11 @@ export class PhilipsAdapter implements HearingAidAdapter {
     console.log('[PhilipsAdapter] Disconnected');
   }
 
-  /** Clamp a volume level to the device's reported range (if known). */
+  /** Clamp a volume level to the device's reported UINT16 range (if known). */
   private clampVolume(level: number, channel: 'main' | 'streaming' | 'tinnitus'): number {
-    const rounded = Math.max(0, Math.min(255, Math.round(level)));
+    const rounded = Math.max(0, Math.min(100, Math.round(level)));
     if (!this.volumeRanges) return rounded;
-    // volumeRanges layout: [main_min, main_max, stream_min, stream_max, tinnitus_min, tinnitus_max]
+    // volumeRanges layout (UINT16 LE pairs): [mainMin, mainMax, streamMin, streamMax, tinnitusMin, tinnitusMax]
     const offset = channel === 'main' ? 0 : channel === 'streaming' ? 2 : 4;
     if (this.volumeRanges.length > offset + 1) {
       return Math.max(this.volumeRanges[offset], Math.min(this.volumeRanges[offset + 1], rounded));
@@ -362,24 +407,23 @@ export class PhilipsAdapter implements HearingAidAdapter {
 
   /**
    * Set main hearing aid volume.
-   * POLARIS path: writes [levelByte, invMuteByte] to main volume char (1454e9d6).
-   * HearLink path: writes [levelByte, invMuteByte] to command char (43c8465e).
-   *   HearLink wire format is inferred from POLARIS pattern — not yet runtime-validated.
+   * POLARIS path: writes UINT16 level (LE) + UINT16 mute=1 (LE) to 1454e9d6.
+   * HearLink path: writes same format to command char (43c8465e) — inferred.
    * Per-ear control requires connecting to each device independently.
    */
   async setVolume(level: number, _ear?: 'left' | 'right' | 'both'): Promise<void> {
     const dev = this.connected;
     const clamped = this.clampVolume(level, 'main');
-    const muteFlag = this.lastKnownMute ? 0 : 1;
-    console.log(`[PhilipsAdapter] setVolume(${clamped}, muteFlag=${muteFlag})`);
+    // 4 bytes: UINT16 level LE + UINT16 mute LE (1=unmuted)
+    const payload = [clamped & 0xFF, (clamped >> 8) & 0xFF, 1, 0];
+    console.log(`[PhilipsAdapter] setVolume(${clamped}) -> [${payload.join(', ')}]`);
 
     if (this.useHearLink) {
-      // HearLink: use command channel. Format inferred — [level, muteFlag] per POLARIS pattern.
       await withRetry(() =>
         dev.writeCharacteristicWithResponseForService(
           HEARLINK_SERVICE,
           HL_COMMAND_CHAR,
-          bytesToBase64([clamped, muteFlag]),
+          bytesToBase64(payload),
         ),
       );
     } else {
@@ -387,7 +431,7 @@ export class PhilipsAdapter implements HearingAidAdapter {
         dev.writeCharacteristicWithoutResponseForService(
           POLARIS_SERVICE,
           MAIN_VOLUME_CHAR,
-          bytesToBase64([clamped, muteFlag]),
+          bytesToBase64(payload),
         ),
       );
     }
@@ -423,12 +467,14 @@ export class PhilipsAdapter implements HearingAidAdapter {
       );
       if (char.value) {
         const bytes = base64ToBytes(char.value);
-        this.lastKnownVolume = bytes[0];
         if (bytes.length >= 2) {
-          this.lastKnownMute = bytes[1] === 0;
+          this.lastKnownVolume = bytes[0] | (bytes[1] << 8);
         }
-        console.log(`[PhilipsAdapter] POLARIS getVolume: level=${bytes[0]}${bytes.length >= 2 ? `, mute=${bytes[1] === 0}` : ''}`);
-        return bytes[0];
+        if (bytes.length >= 4) {
+          this.lastKnownMute = (bytes[2] | (bytes[3] << 8)) === 0;
+        }
+        console.log(`[PhilipsAdapter] POLARIS getVolume: level=${this.lastKnownVolume}, mute=${this.lastKnownMute}`);
+        return this.lastKnownVolume;
       }
     } catch {
       console.log('[PhilipsAdapter] POLARIS volume read failed, using lastKnownVolume');
@@ -438,27 +484,28 @@ export class PhilipsAdapter implements HearingAidAdapter {
 
   /**
    * Set mute state.
-   * POLARIS: byte1 of volume char — 0 = muted, 1 = unmuted (confirmed).
-   * HearLink: writes [currentLevel, muteFlag] to command char (inferred).
+   * Mute: write [0, 0, 0, 0] (UINT16 level=0 + UINT16 mute=0).
+   * Unmute: write [level_lo, level_hi, 1, 0] (restore volume, mute=1).
    */
   async setMute(muted: boolean): Promise<void> {
     const dev = this.connected;
     console.log(`[PhilipsAdapter] setMute(${muted})`);
-    let currentLevel = this.lastKnownVolume;
-    try {
-      currentLevel = await this.getVolume();
-    } catch {
-      // Fall back to lastKnownVolume if current volume unreadable
-    }
     this.lastKnownMute = muted;
-    const muteFlag = muted ? 0 : 1;
+
+    let payload: number[];
+    if (muted) {
+      payload = [0, 0, 0, 0];
+    } else {
+      const currentLevel = this.lastKnownVolume > 0 ? this.lastKnownVolume : 50;
+      payload = [currentLevel & 0xFF, (currentLevel >> 8) & 0xFF, 1, 0];
+    }
 
     if (this.useHearLink) {
       await withRetry(() =>
         dev.writeCharacteristicWithResponseForService(
           HEARLINK_SERVICE,
           HL_COMMAND_CHAR,
-          bytesToBase64([currentLevel, muteFlag]),
+          bytesToBase64(payload),
         ),
       );
     } else {
@@ -466,7 +513,7 @@ export class PhilipsAdapter implements HearingAidAdapter {
         dev.writeCharacteristicWithoutResponseForService(
           POLARIS_SERVICE,
           MAIN_VOLUME_CHAR,
-          bytesToBase64([currentLevel, muteFlag]),
+          bytesToBase64(payload),
         ),
       );
     }
@@ -486,7 +533,7 @@ export class PhilipsAdapter implements HearingAidAdapter {
       );
       if (char.value) {
         const bytes = base64ToBytes(char.value);
-        const muted = bytes.length >= 2 ? bytes[1] === 0 : false;
+        const muted = bytes.length >= 4 ? (bytes[2] | (bytes[3] << 8)) === 0 : false;
         this.lastKnownMute = muted;
         console.log(`[PhilipsAdapter] getMute: ${muted}`);
         return muted;
@@ -695,19 +742,19 @@ export class PhilipsAdapter implements HearingAidAdapter {
 
   /**
    * Set streaming audio volume via POLARIS streaming volume characteristic (50632720).
-   * Same 2-byte format as main volume: [level, invMute].
+   * Same 4-byte format as main volume: UINT16 level LE + UINT16 mute LE.
    */
   async setStreamingVolume(level: number): Promise<void> {
     const dev = this.connected;
     const clamped = this.clampVolume(level, 'streaming');
-    const muteFlag = this.lastKnownMute ? 0 : 1;
-    console.log(`[PhilipsAdapter] setStreamingVolume(${clamped}, muteFlag=${muteFlag})`);
+    const payload = [clamped & 0xFF, (clamped >> 8) & 0xFF, 1, 0];
+    console.log(`[PhilipsAdapter] setStreamingVolume(${clamped}) -> [${payload.join(', ')}]`);
 
     await withRetry(() =>
       dev.writeCharacteristicWithoutResponseForService(
         POLARIS_SERVICE,
         STREAMING_VOLUME_CHAR,
-        bytesToBase64([clamped, muteFlag]),
+        bytesToBase64(payload),
       ),
     );
   }
@@ -752,16 +799,18 @@ export class PhilipsAdapter implements HearingAidAdapter {
       }
       muted = this.lastKnownMute;
     } else {
-      // POLARIS: read main volume + mute from single characteristic
+      // POLARIS: read main volume + mute (4-byte UINT16 LE format)
       try {
         const volChar = await withRetry(() =>
           dev.readCharacteristicForService(POLARIS_SERVICE, MAIN_VOLUME_CHAR),
         );
         if (volChar.value) {
           const bytes = base64ToBytes(volChar.value);
-          volume = bytes[0];
           if (bytes.length >= 2) {
-            muted = bytes[1] === 0;
+            volume = bytes[0] | (bytes[1] << 8);
+          }
+          if (bytes.length >= 4) {
+            muted = (bytes[2] | (bytes[3] << 8)) === 0;
             this.lastKnownMute = muted;
           }
         }

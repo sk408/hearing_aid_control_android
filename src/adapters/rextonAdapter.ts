@@ -55,6 +55,10 @@ const BASIC_CONTROL_CHAR = '8b8276e8-0f0c-40bb-b422-3770fa72a864';
 /** Program notify: subscribe for active program changes (confirmed) */
 const PROGRAM_NOTIFY_CHAR = '8b8225e0-0f0c-40bb-b422-3770fa72a864';
 
+// ── FAPI service (advanced protocol — skip for now, use POLARIS direct writes) ──
+
+const FAPI_SERVICE = 'd1d4dc2a-215f-44d2-b44c-0f4de3c91af2';
+
 // ── Control/FAPI service + characteristics (rexton_uuid_dossier_01) ──
 
 const CONTROL_SERVICE = 'c8f7a831-21b2-45b8-87f8-bd49a13eff49';
@@ -230,9 +234,13 @@ export class RextonAdapter implements HearingAidAdapter {
     console.log(`[RextonAdapter] Connecting to ${deviceId}...`);
 
     this.device = await withRetry(() =>
-      manager.connectToDevice(deviceId, { requestMTU: 512 }),
+      manager.connectToDevice(deviceId, { requestMTU: 255 }),
     );
-    console.log('[RextonAdapter] GATT connected, discovering services...');
+    console.log('[RextonAdapter] GATT connected, requesting MTU...');
+
+    // Explicitly request MTU 255 (minimum required: 158)
+    await manager.requestMTUForDevice(deviceId, 255);
+    console.log('[RextonAdapter] MTU negotiated, discovering services...');
 
     await this.device.discoverAllServicesAndCharacteristics();
     console.log('[RextonAdapter] Service discovery complete');
@@ -277,13 +285,13 @@ export class RextonAdapter implements HearingAidAdapter {
         (error, char) => {
           if (error || !char?.value) return;
           const bytes = base64ToBytes(char.value);
-          if (bytes.length >= 1) {
-            this.lastKnownVolume = bytes[0];
-            console.log(`[RextonAdapter] Volume notify: level=${bytes[0]}${bytes.length >= 2 ? `, mute=${bytes[1] === 0}` : ''}`);
-          }
           if (bytes.length >= 2) {
-            this.lastKnownMute = bytes[1] === 0;
+            this.lastKnownVolume = bytes[0] | (bytes[1] << 8);
           }
+          if (bytes.length >= 4) {
+            this.lastKnownMute = (bytes[2] | (bytes[3] << 8)) === 0;
+          }
+          console.log(`[RextonAdapter] Volume notify: level=${this.lastKnownVolume}, mute=${this.lastKnownMute}`);
         },
       );
       console.log('[RextonAdapter] Subscribed to POLARIS volume notifications');
@@ -291,6 +299,25 @@ export class RextonAdapter implements HearingAidAdapter {
       // POLARIS main volume char may not be available on all Rexton firmware versions.
       // Volume tracking will rely on lastKnownVolume from setVolume() calls.
       console.log('[RextonAdapter] POLARIS volume subscription not available — using local tracking');
+    }
+
+    // Subscribe to shared POLARIS program select char (535442f7) for program state
+    try {
+      this.device.monitorCharacteristicForService(
+        POLARIS_SERVICE,
+        POLARIS_PROGRAM_CHAR,
+        (error, char) => {
+          if (error || !char?.value) return;
+          const bytes = base64ToBytes(char.value);
+          if (bytes.length >= 1) {
+            this.lastKnownProgram = bytes[0];
+            console.log(`[RextonAdapter] POLARIS program notify: program=${bytes[0]}`);
+          }
+        },
+      );
+      console.log('[RextonAdapter] Subscribed to POLARIS program notifications');
+    } catch {
+      console.log('[RextonAdapter] POLARIS program subscription not available');
     }
 
     console.log('[RextonAdapter] Connection setup complete');
@@ -332,15 +359,22 @@ export class RextonAdapter implements HearingAidAdapter {
   }
 
   /**
-   * Set volume via Terminal IO Basic Control.
-   * Writes [0x04, volumePosition] (confirmed).
-   * Per-ear control requires connecting to each device independently —
-   * the ear parameter is accepted for interface conformance only.
+   * Set volume via shared POLARIS characteristic (1454e9d6).
+   * Writes UINT16 level (LE) + UINT16 mute=1 (LE) = 4 bytes.
+   * Same format as Philips (shared Demant platform).
    */
   async setVolume(level: number, _ear?: 'left' | 'right' | 'both'): Promise<void> {
-    const clamped = Math.max(0, Math.min(255, Math.round(level)));
-    console.log(`[RextonAdapter] setVolume(${clamped})`);
-    await this.writeBasicControl(OP_VOLUME, clamped);
+    const dev = this.connected;
+    const clamped = Math.max(0, Math.min(100, Math.round(level)));
+    const payload = [clamped & 0xFF, (clamped >> 8) & 0xFF, 1, 0];
+    console.log(`[RextonAdapter] setVolume(${clamped}) -> [${payload.join(', ')}]`);
+    await withRetry(() =>
+      dev.writeCharacteristicWithoutResponseForService(
+        POLARIS_SERVICE,
+        MAIN_VOLUME_CHAR,
+        bytesToBase64(payload),
+      ),
+    );
     this.lastKnownVolume = clamped;
   }
 
@@ -359,14 +393,14 @@ export class RextonAdapter implements HearingAidAdapter {
       );
       if (char.value) {
         const bytes = base64ToBytes(char.value);
-        if (bytes.length >= 1) {
-          this.lastKnownVolume = bytes[0];
-        }
         if (bytes.length >= 2) {
-          this.lastKnownMute = bytes[1] === 0;
+          this.lastKnownVolume = bytes[0] | (bytes[1] << 8);
         }
-        console.log(`[RextonAdapter] Read POLARIS volume: level=${bytes[0]}${bytes.length >= 2 ? `, mute=${bytes[1] === 0}` : ''}`);
-        return bytes[0];
+        if (bytes.length >= 4) {
+          this.lastKnownMute = (bytes[2] | (bytes[3] << 8)) === 0;
+        }
+        console.log(`[RextonAdapter] Read POLARIS volume: level=${this.lastKnownVolume}, mute=${this.lastKnownMute}`);
+        return this.lastKnownVolume;
       }
     } catch {
       // POLARIS main volume char may not be readable on all Rexton firmware.
@@ -377,22 +411,29 @@ export class RextonAdapter implements HearingAidAdapter {
   }
 
   /**
-   * Mute/unmute the hearing aid.
-   * TODO: No confirmed dedicated mute opcode in Terminal IO Basic Control
-   * (command_dictionary.md — mute is routed via advanced/FAPI receiver-state
-   * paths). Using volume-minimum emulation as fallback.
+   * Mute/unmute via shared POLARIS volume characteristic.
+   * Mute: write [0, 0, 0, 0] (UINT16 level=0 + UINT16 mute=0).
+   * Unmute: write [level_lo, level_hi, 1, 0] (restore volume, mute=1).
    */
   async setMute(muted: boolean): Promise<void> {
+    const dev = this.connected;
     console.log(`[RextonAdapter] setMute(${muted})`);
     this.lastKnownMute = muted;
+
+    let payload: number[];
     if (muted) {
-      // Fallback: set volume to 0 (minimum) to emulate mute
-      await this.writeBasicControl(OP_VOLUME, 0);
+      payload = [0, 0, 0, 0];
     } else {
-      // Restore last known volume (or reasonable default)
-      const restoreLevel = this.lastKnownVolume > 0 ? this.lastKnownVolume : 128;
-      await this.writeBasicControl(OP_VOLUME, restoreLevel);
+      const restoreLevel = this.lastKnownVolume > 0 ? this.lastKnownVolume : 50;
+      payload = [restoreLevel & 0xFF, (restoreLevel >> 8) & 0xFF, 1, 0];
     }
+    await withRetry(() =>
+      dev.writeCharacteristicWithoutResponseForService(
+        POLARIS_SERVICE,
+        MAIN_VOLUME_CHAR,
+        bytesToBase64(payload),
+      ),
+    );
   }
 
   async getMute(): Promise<boolean> {
@@ -400,10 +441,20 @@ export class RextonAdapter implements HearingAidAdapter {
     return this.lastKnownMute;
   }
 
-  /** Write [0x05, program_index] to Terminal IO Basic Control (confirmed). */
+  /**
+   * Set program via shared POLARIS characteristic (535442f7).
+   * Writes 1 byte = program index. Same format as Philips.
+   */
   async setProgram(index: number): Promise<void> {
+    const dev = this.connected;
     console.log(`[RextonAdapter] setProgram(${index})`);
-    await this.writeBasicControl(OP_PROGRAM, index);
+    await withRetry(() =>
+      dev.writeCharacteristicWithoutResponseForService(
+        POLARIS_SERVICE,
+        POLARIS_PROGRAM_CHAR,
+        bytesToBase64([index & 0xFF]),
+      ),
+    );
     this.lastKnownProgram = index;
   }
 
