@@ -183,12 +183,20 @@ export class PhilipsAdapter implements HearingAidAdapter {
   private device: Device | null = null;
   private deviceId: string | null = null;
   private lastKnownMute = false;
+  private lastKnownVolume = 0;
+  private lastKnownProgram = 0;
 
   /** True when HearLink proprietary service (ba50125d) is used instead of POLARIS */
   private useHearLink = false;
 
   /** Subscription for HearLink command channel notifications (43c8465e) */
   private hlCommandSub: Subscription | null = null;
+
+  /** Subscription for POLARIS main volume notifications (1454e9d6) */
+  private volumeNotifySub: Subscription | null = null;
+
+  /** Subscription for POLARIS program select notifications (535442f7) */
+  private programNotifySub: Subscription | null = null;
 
   /** Cached volume ranges from device: [mainMin, mainMax, streamMin, streamMax, ...] */
   private volumeRanges: number[] | null = null;
@@ -204,12 +212,15 @@ export class PhilipsAdapter implements HearingAidAdapter {
   async connect(deviceId: string): Promise<void> {
     const manager = getBleManager();
     this.deviceId = deviceId;
+    console.log(`[PhilipsAdapter] Connecting to ${deviceId}...`);
 
     this.device = await withRetry(() =>
       manager.connectToDevice(deviceId, { requestMTU: 512 }),
     );
+    console.log('[PhilipsAdapter] GATT connected, discovering services...');
 
     await this.device.discoverAllServicesAndCharacteristics();
+    console.log('[PhilipsAdapter] Service discovery complete');
 
     // Ensure Android-level BLE bond before any secured characteristic access.
     // Without this, writes to proprietary characteristics fail with
@@ -230,17 +241,25 @@ export class PhilipsAdapter implements HearingAidAdapter {
     this.useHearLink = serviceUuids.some(
       (u) => u.replace(/-/g, '') === HEARLINK_SERVICE.replace(/-/g, ''),
     );
+    console.log(`[PhilipsAdapter] Service path: ${this.useHearLink ? 'HearLink (ba50125d)' : 'POLARIS (56772eaf)'}`);
 
     if (this.useHearLink) {
       // Subscribe to HearLink command channel notifications for command responses
       this.hlCommandSub = this.device.monitorCharacteristicForService(
         HEARLINK_SERVICE,
         HL_COMMAND_CHAR,
-        (_error, _char) => {
-          // Command response handler — captures acknowledge/state updates.
+        (error, char) => {
+          if (error) {
+            console.log('[PhilipsAdapter] HearLink command notify error:', error.message);
+            return;
+          }
+          if (!char?.value) return;
+          const bytes = base64ToBytes(char.value);
+          console.log(`[PhilipsAdapter] HearLink command notify: [${bytes.map(b => '0x' + b.toString(16).padStart(2, '0')).join(', ')}]`);
           // TODO: Parse response payload once wire protocol is decoded.
         },
       );
+      console.log('[PhilipsAdapter] Subscribed to HearLink command notifications');
     } else {
       // POLARIS path: read volume ranges so we can clamp writes to valid device limits
       try {
@@ -249,17 +268,72 @@ export class PhilipsAdapter implements HearingAidAdapter {
         );
         if (rangeChar.value) {
           this.volumeRanges = base64ToBytes(rangeChar.value);
+          console.log(`[PhilipsAdapter] Volume ranges: [${this.volumeRanges.join(', ')}]`);
         }
       } catch {
-        // Volume ranges char may not be present on all POLARIS firmware versions
+        console.log('[PhilipsAdapter] Volume ranges char not available — skipping clamp');
+      }
+
+      // Subscribe to POLARIS main volume char (1454e9d6) for real-time volume state.
+      // Format: [level, invMute] where invMute 1=unmuted, 0=muted.
+      try {
+        this.volumeNotifySub = this.device.monitorCharacteristicForService(
+          POLARIS_SERVICE,
+          MAIN_VOLUME_CHAR,
+          (error, char) => {
+            if (error || !char?.value) return;
+            const bytes = base64ToBytes(char.value);
+            if (bytes.length >= 1) {
+              this.lastKnownVolume = bytes[0];
+            }
+            if (bytes.length >= 2) {
+              this.lastKnownMute = bytes[1] === 0;
+            }
+            console.log(`[PhilipsAdapter] Volume notify: level=${bytes[0]}${bytes.length >= 2 ? `, mute=${bytes[1] === 0}` : ''}`);
+          },
+        );
+        console.log('[PhilipsAdapter] Subscribed to POLARIS volume notifications');
+      } catch {
+        console.log('[PhilipsAdapter] POLARIS volume subscription not available');
+      }
+
+      // Subscribe to POLARIS program select char (535442f7) for real-time program state.
+      // Notify returns byte[0] = active program index.
+      try {
+        this.programNotifySub = this.device.monitorCharacteristicForService(
+          POLARIS_SERVICE,
+          PROGRAM_SELECT_CHAR,
+          (error, char) => {
+            if (error || !char?.value) return;
+            const bytes = base64ToBytes(char.value);
+            if (bytes.length >= 1) {
+              this.lastKnownProgram = bytes[0];
+              console.log(`[PhilipsAdapter] Program notify: program=${bytes[0]}`);
+            }
+          },
+        );
+        console.log('[PhilipsAdapter] Subscribed to POLARIS program notifications');
+      } catch {
+        console.log('[PhilipsAdapter] POLARIS program subscription not available');
       }
     }
+
+    console.log('[PhilipsAdapter] Connection setup complete');
   }
 
   async disconnect(): Promise<void> {
+    console.log('[PhilipsAdapter] Disconnecting...');
     if (this.hlCommandSub) {
       this.hlCommandSub.remove();
       this.hlCommandSub = null;
+    }
+    if (this.volumeNotifySub) {
+      this.volumeNotifySub.remove();
+      this.volumeNotifySub = null;
+    }
+    if (this.programNotifySub) {
+      this.programNotifySub.remove();
+      this.programNotifySub = null;
     }
     if (this.device) {
       try {
@@ -271,6 +345,7 @@ export class PhilipsAdapter implements HearingAidAdapter {
       this.deviceId = null;
       this.useHearLink = false;
     }
+    console.log('[PhilipsAdapter] Disconnected');
   }
 
   /** Clamp a volume level to the device's reported range (if known). */
@@ -296,6 +371,7 @@ export class PhilipsAdapter implements HearingAidAdapter {
     const dev = this.connected;
     const clamped = this.clampVolume(level, 'main');
     const muteFlag = this.lastKnownMute ? 0 : 1;
+    console.log(`[PhilipsAdapter] setVolume(${clamped}, muteFlag=${muteFlag})`);
 
     if (this.useHearLink) {
       // HearLink: use command channel. Format inferred — [level, muteFlag] per POLARIS pattern.
@@ -315,6 +391,7 @@ export class PhilipsAdapter implements HearingAidAdapter {
         ),
       );
     }
+    this.lastKnownVolume = clamped;
   }
 
   async getVolume(): Promise<number> {
@@ -323,24 +400,40 @@ export class PhilipsAdapter implements HearingAidAdapter {
     if (this.useHearLink) {
       // HearLink: read state char (e6c02a45). Bytes[8..10] appear to be volume levels
       // based on probe data (all 0x80 = midpoint on fresh device).
-      const char = await withRetry(() =>
-        dev.readCharacteristicForService(HEARLINK_SERVICE, HL_STATE_CHAR),
-      );
-      if (!char.value) throw new Error('No value from HearLink state characteristic');
-      const bytes = base64ToBytes(char.value);
-      // byte[8] = main volume (inferred from probe: 0x80 = midpoint)
-      return bytes.length > 8 ? bytes[8] : 0;
+      try {
+        const char = await withRetry(() =>
+          dev.readCharacteristicForService(HEARLINK_SERVICE, HL_STATE_CHAR),
+        );
+        if (char.value) {
+          const bytes = base64ToBytes(char.value);
+          const vol = bytes.length > 8 ? bytes[8] : 0;
+          console.log(`[PhilipsAdapter] HearLink getVolume: ${vol} (from state char)`);
+          this.lastKnownVolume = vol;
+          return vol;
+        }
+      } catch {
+        console.log('[PhilipsAdapter] HearLink state read failed, using lastKnownVolume');
+      }
+      return this.lastKnownVolume;
     }
 
-    const char = await withRetry(() =>
-      dev.readCharacteristicForService(POLARIS_SERVICE, MAIN_VOLUME_CHAR),
-    );
-    if (!char.value) throw new Error('No value from volume characteristic');
-    const bytes = base64ToBytes(char.value);
-    if (bytes.length >= 2) {
-      this.lastKnownMute = bytes[1] === 0;
+    try {
+      const char = await withRetry(() =>
+        dev.readCharacteristicForService(POLARIS_SERVICE, MAIN_VOLUME_CHAR),
+      );
+      if (char.value) {
+        const bytes = base64ToBytes(char.value);
+        this.lastKnownVolume = bytes[0];
+        if (bytes.length >= 2) {
+          this.lastKnownMute = bytes[1] === 0;
+        }
+        console.log(`[PhilipsAdapter] POLARIS getVolume: level=${bytes[0]}${bytes.length >= 2 ? `, mute=${bytes[1] === 0}` : ''}`);
+        return bytes[0];
+      }
+    } catch {
+      console.log('[PhilipsAdapter] POLARIS volume read failed, using lastKnownVolume');
     }
-    return bytes[0];
+    return this.lastKnownVolume;
   }
 
   /**
@@ -350,11 +443,12 @@ export class PhilipsAdapter implements HearingAidAdapter {
    */
   async setMute(muted: boolean): Promise<void> {
     const dev = this.connected;
-    let currentLevel = 0;
+    console.log(`[PhilipsAdapter] setMute(${muted})`);
+    let currentLevel = this.lastKnownVolume;
     try {
       currentLevel = await this.getVolume();
     } catch {
-      // Fall back to 0 if current volume unreadable
+      // Fall back to lastKnownVolume if current volume unreadable
     }
     this.lastKnownMute = muted;
     const muteFlag = muted ? 0 : 1;
@@ -386,14 +480,21 @@ export class PhilipsAdapter implements HearingAidAdapter {
       return this.lastKnownMute;
     }
 
-    const char = await withRetry(() =>
-      dev.readCharacteristicForService(POLARIS_SERVICE, MAIN_VOLUME_CHAR),
-    );
-    if (!char.value) throw new Error('No value from volume characteristic');
-    const bytes = base64ToBytes(char.value);
-    const muted = bytes.length >= 2 ? bytes[1] === 0 : false;
-    this.lastKnownMute = muted;
-    return muted;
+    try {
+      const char = await withRetry(() =>
+        dev.readCharacteristicForService(POLARIS_SERVICE, MAIN_VOLUME_CHAR),
+      );
+      if (char.value) {
+        const bytes = base64ToBytes(char.value);
+        const muted = bytes.length >= 2 ? bytes[1] === 0 : false;
+        this.lastKnownMute = muted;
+        console.log(`[PhilipsAdapter] getMute: ${muted}`);
+        return muted;
+      }
+    } catch {
+      console.log('[PhilipsAdapter] POLARIS mute read failed, using lastKnownMute');
+    }
+    return this.lastKnownMute;
   }
 
   /**
@@ -405,6 +506,7 @@ export class PhilipsAdapter implements HearingAidAdapter {
    */
   async setProgram(index: number): Promise<void> {
     const dev = this.connected;
+    console.log(`[PhilipsAdapter] setProgram(${index})`);
 
     if (this.useHearLink) {
       // HearLink: write program index to command channel.
@@ -425,22 +527,32 @@ export class PhilipsAdapter implements HearingAidAdapter {
         ),
       );
     }
+    this.lastKnownProgram = index;
   }
 
   async getProgram(): Promise<number> {
     const dev = this.connected;
 
     if (this.useHearLink) {
-      // HearLink: program index not yet mapped in state char — return 0 as default.
+      // HearLink: program index not yet mapped in state char — return tracked state.
       // TODO: Identify which byte in HL_STATE_CHAR encodes active program.
-      return 0;
+      return this.lastKnownProgram;
     }
 
-    const char = await withRetry(() =>
-      dev.readCharacteristicForService(POLARIS_SERVICE, PROGRAM_SELECT_CHAR),
-    );
-    if (!char.value) throw new Error('No value from program characteristic');
-    return base64ToBytes(char.value)[0];
+    try {
+      const char = await withRetry(() =>
+        dev.readCharacteristicForService(POLARIS_SERVICE, PROGRAM_SELECT_CHAR),
+      );
+      if (char.value) {
+        const prog = base64ToBytes(char.value)[0];
+        this.lastKnownProgram = prog;
+        console.log(`[PhilipsAdapter] getProgram: ${prog}`);
+        return prog;
+      }
+    } catch {
+      console.log('[PhilipsAdapter] POLARIS program read failed, using lastKnownProgram');
+    }
+    return this.lastKnownProgram;
   }
 
   /**
@@ -545,8 +657,11 @@ export class PhilipsAdapter implements HearingAidAdapter {
         dev.readCharacteristicForService(BATTERY_SERVICE, BATTERY_LEVEL_CHAR),
       );
       if (!char.value) return -1;
-      return base64ToBytes(char.value)[0]; // BAS: single byte 0-100
+      const level = base64ToBytes(char.value)[0]; // BAS: single byte 0-100
+      console.log(`[PhilipsAdapter] Battery: ${level}%`);
+      return level;
     } catch {
+      console.log('[PhilipsAdapter] Battery read failed');
       return -1;
     }
   }
@@ -586,6 +701,7 @@ export class PhilipsAdapter implements HearingAidAdapter {
     const dev = this.connected;
     const clamped = this.clampVolume(level, 'streaming');
     const muteFlag = this.lastKnownMute ? 0 : 1;
+    console.log(`[PhilipsAdapter] setStreamingVolume(${clamped}, muteFlag=${muteFlag})`);
 
     await withRetry(() =>
       dev.writeCharacteristicWithoutResponseForService(
@@ -604,6 +720,7 @@ export class PhilipsAdapter implements HearingAidAdapter {
     const dev = this.connected;
     const clamped = this.clampVolume(level, 'tinnitus');
     const muteFlag = 1; // tinnitus masker unmuted when active
+    console.log(`[PhilipsAdapter] setTinnitusVolume(${clamped})`);
 
     await withRetry(() =>
       dev.writeCharacteristicWithoutResponseForService(
