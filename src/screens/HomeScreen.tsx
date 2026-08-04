@@ -29,6 +29,7 @@ const BRAND_LABELS: Record<string, string> = {
   rexton: 'Rexton',
   starkey: 'Starkey',
   resound: 'ReSound',
+  mfi: 'MFi (Universal)',
   unknown: '?',
 };
 
@@ -37,6 +38,7 @@ const BRAND_COLORS: Record<string, string> = {
   rexton: '#8B4513',
   starkey: '#228B22',
   resound: '#CC6600',
+  mfi: '#6A5ACD',
   unknown: '#AAAAAA',
 };
 

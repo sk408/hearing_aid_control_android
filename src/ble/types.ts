@@ -1,6 +1,6 @@
 /** BLE types adapted from web app for React Native (react-native-ble-plx) */
 
-export type Brand = 'philips' | 'rexton' | 'starkey' | 'resound' | 'unknown';
+export type Brand = 'philips' | 'rexton' | 'starkey' | 'resound' | 'mfi' | 'unknown';
 
 export interface DiscoveredDevice {
   id: string; // peripheral ID (MAC on Android)

@@ -36,6 +36,7 @@ const BRAND_LABELS: Record<string, string> = {
   rexton: 'Rexton (Terminal IO)',
   starkey: 'Starkey (Piccolo)',
   resound: 'ReSound (GN)',
+  mfi: 'MFi (Universal)',
   unknown: 'Unknown Brand',
 };
 
@@ -433,7 +434,8 @@ export function DeviceScreen({ route }: DeviceScreenProps) {
           <Text style={styles.unsupportedTitle}>Not a Supported Hearing Aid</Text>
           <Text style={styles.unsupportedBody}>
             This device was not recognized as a supported hearing aid.
-            Supported brands: Philips, Rexton, Starkey, and ReSound.
+            Supported brands: Philips, Rexton, Starkey, ReSound, and any
+            standardized MFi hearing aid.
           </Text>
         </View>
       )}

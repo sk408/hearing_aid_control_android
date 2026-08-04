@@ -7,6 +7,7 @@ import { PhilipsAdapter } from './philipsAdapter';
 import { RextonAdapter } from './rextonAdapter';
 import { StarkeyAdapter } from './starkeyAdapter';
 import { ResoundAdapter } from './resoundAdapter';
+import { MfiAdapter } from './mfiAdapter';
 
 export function createAdapter(brand: Brand): HearingAidAdapter | null {
   switch (brand) {
@@ -18,6 +19,8 @@ export function createAdapter(brand: Brand): HearingAidAdapter | null {
       return new StarkeyAdapter();
     case 'resound':
       return new ResoundAdapter();
+    case 'mfi':
+      return new MfiAdapter();
     case 'unknown':
       return null;
   }

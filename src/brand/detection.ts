@@ -17,6 +17,9 @@ const RESOUND_GN_NOTIFY = '8b51a2ca-5bed-418b-b54b-22fe666aadd2';
 const RESOUND_GN_MIC_ATTENUATION = '32c9322d-6b17-11cf-0234-6f0da5eafd75';
 const RESOUND_GN_ACTIVE_PROGRAM = 'dc82f820-63ac-f82f-1e89-372fde4151f4';
 
+/** Standardized MFi / LEA hearing-aid control service (MFI_SPEC.md §1.1) */
+const MFI_LEA_SERVICE = '7d74f4bd-c74a-4431-862c-cce884371592';
+
 function normalizeUuid(uuid: string): string {
   return uuid.toLowerCase().replace(/-/g, '');
 }
@@ -86,7 +89,16 @@ export function detectBrandFromDiscovery(
     return 'philips';
   }
 
-  // 6. Name-based fallback ("HearLink") is handled by inferBrandFromBluetoothName()
+  // 6. MFi / LEA universal control surface — checked LAST so devices that
+  //    match a brand-specific signature above (e.g. ReSound GN aids, which
+  //    also expose the LEA service) keep their dedicated adapter. Devices
+  //    with only the standardized LEA service fall through to the universal
+  //    MFi adapter.
+  if (hasService(normServices, MFI_LEA_SERVICE)) {
+    return 'mfi';
+  }
+
+  // 7. Name-based fallback ("HearLink") is handled by inferBrandFromBluetoothName()
   //    in scanner.ts — this function is UUID-only by design.
 
   return 'unknown';
