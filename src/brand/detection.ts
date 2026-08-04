@@ -53,17 +53,28 @@ export function detectBrandFromDiscovery(
   const normServices = services.map((s) => s.replace(/-/g, ''));
   const normChars = characteristics.map((c) => c.replace(/-/g, ''));
 
-  // 1. Starkey — unique service UUID
+  // 1. MFi / LEA universal control surface — checked FIRST on this branch
+  //    (feature/mfi-control). Rationale: this branch is a universal-MFi
+  //    remote, so ANY device exposing the standardized LEA service —
+  //    including ReSound GN aids that also expose LEA — gets the MFi
+  //    adapter. Brand-specific checks below only apply to devices WITHOUT
+  //    the LEA service.
+  //    NOTE: branch-scoped experiment; consolidation with main comes later.
+  if (hasService(normServices, MFI_LEA_SERVICE)) {
+    return 'mfi';
+  }
+
+  // 2. Starkey — unique service UUID
   if (hasService(normServices, '9a04f079-9840-4286-ab92-e65be0885f95')) {
     return 'starkey';
   }
 
-  // 2. ReSound — e0262760 prefix family (newer stacks)
+  // 3. ReSound — e0262760 prefix family (newer stacks)
   if (hasPrefix(normServices, 'e0262760')) {
     return 'resound';
   }
 
-  // 3. ReSound — FEFE service + any GN characteristic (tightened to avoid false positives)
+  // 4. ReSound — FEFE service + any GN characteristic (tightened to avoid false positives)
   if (hasService(normServices, RESOUND_FEFE_SERVICE)) {
     if (
       hasCharacteristic(normChars, RESOUND_GN_COMMAND) ||
@@ -75,27 +86,18 @@ export function detectBrandFromDiscovery(
     }
   }
 
-  // 4. Philips HearLink proprietary service (ba50125d) — newer HearLink 9050+ models.
+  // 5. Philips HearLink proprietary service (ba50125d) — newer HearLink 9050+ models.
   //    Confirmed via live BLE probe on HearLink 9050 (FW rel_7.3_30.0).
   if (hasService(normServices, 'ba50125d-0806-42ab-8bf1-22e0b954a8fa')) {
     return 'philips';
   }
 
-  // 5. Philips / Rexton — shared POLARIS service, differentiated by Terminal IO
+  // 6. Philips / Rexton — shared POLARIS service, differentiated by Terminal IO
   if (hasService(normServices, '56772eaf-2153-4f74-acf3-4368d99fbf5a')) {
     if (normServices.some((s) => s.startsWith('8b82'))) {
       return 'rexton';
     }
     return 'philips';
-  }
-
-  // 6. MFi / LEA universal control surface — checked LAST so devices that
-  //    match a brand-specific signature above (e.g. ReSound GN aids, which
-  //    also expose the LEA service) keep their dedicated adapter. Devices
-  //    with only the standardized LEA service fall through to the universal
-  //    MFi adapter.
-  if (hasService(normServices, MFI_LEA_SERVICE)) {
-    return 'mfi';
   }
 
   // 7. Name-based fallback ("HearLink") is handled by inferBrandFromBluetoothName()

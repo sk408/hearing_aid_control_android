@@ -4,6 +4,49 @@ Branch: `feature/mfi-control` (from `main` @ d6abce4)
 Date: 2026-08-04
 Tasks: TASK13 — MFi-only control branch. TASK14 — MFi adapter polish:
 MFi-only device filter + auto-pairing of binaural sets.
+TASK15 — detection priority flip: MFi claims all LEA-capable devices.
+
+---
+
+## TASK15 — detection priority flip (2026-08-04, third session)
+
+### What changed
+- `src/brand/detection.ts` — the LEA service check
+  (`7d74f4bd-c74a-4431-862c-cce884371592`) moved from LAST to FIRST in
+  `detectBrandFromDiscovery()`. Any device exposing the LEA service now
+  gets the MFi adapter; brand-specific signatures (Starkey, ReSound
+  e0262760/FEFE+GN, Philips, POLARIS) are only evaluated for devices that
+  do NOT expose LEA.
+
+### Rationale
+- This branch is a universal-MFi remote. Before TASK15, ReSound GN aids —
+  which expose both the GN proprietary services AND the standardized LEA
+  service — matched the ReSound signature first and got the ReSound
+  adapter, bypassing the MFi control surface this branch exists to
+  exercise. TASK13/14's MFi-only UI filter already hides non-LEA devices,
+  so brand adapters are unreachable in the UI anyway; flipping detection
+  priority makes the connect path consistent with the filter.
+- Scope: branch-only experiment. A comment in detection.ts notes that
+  consolidation with `main` (where LEA must stay LAST so brand adapters
+  win) comes later — do NOT cherry-pick this flip to main as-is.
+
+### Effect on each device family
+- ReSound GN aids (LEA + GN services): now → MFi adapter (was ReSound).
+- Any other MFi aid exposing LEA + a brand signature: now → MFi adapter.
+- Devices without the LEA service: unchanged — brand detection as before,
+  and they remain hidden by the TASK14 MFi-only UI filter.
+
+### Verification
+- `tsc --noEmit`: clean.
+- Release APK rebuilt (`cd android && gradlew.bat assembleRelease`): see
+  "Build" section.
+
+### Untested (needs live device)
+1. ReSound Vivia/Lacerta aids now connect via the MFi adapter end-to-end
+   (bond → LEA verify → battery/program/volume) instead of the ReSound
+   adapter.
+2. No regression for the TASK14 binaural set flow (grouping + connectMfiSet
+   were already adapter-agnostic, but confirm the set entries still form).
 
 ---
 
