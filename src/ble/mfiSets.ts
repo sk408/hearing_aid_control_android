@@ -1,16 +1,16 @@
 /**
- * MFi device filtering + binaural set grouping (TASK14).
+ * MFi device filtering + binaural set grouping (TASK14, reworked TASK16).
  *
  * Two concerns, both brand-agnostic and MFi-adapter-scoped:
  *
- * 1. MFi-only device filter. MFI_SPEC.md §4.4: whether the 128-bit LEA
- *    service UUID appears in the adv packet or scan response is UNCONFIRMED,
- *    so a single-stage adv filter is not reliable. Two-stage approach:
- *      Stage 1 — devices that DO advertise the LEA UUID pass immediately.
- *      Stage 2 — candidates that don't are verified in the background:
- *                brief connect + service discovery; devices without the LEA
- *                service are rejected and hidden from the list. Verdicts are
- *                cached for the app session so re-scans don't re-verify.
+ * 1. MFi-only fast list (TASK16). A scanned device appears in the list
+ *    IMMEDIATELY when:
+ *      (a) its advertised service UUIDs include the LEA service UUID, OR
+ *      (b) its device id is in the persisted verified-MFi set (AsyncStorage
+ *          `@mfi_verified`), populated after any successful LEA-service
+ *          confirmation during an actual connect flow (DeviceScreen).
+ *    Unknown candidates are NEVER connected-to during scanning — they simply
+ *    do not appear. There is no standalone verification probe.
  *
  * 2. Binaural set grouping. Verified MFi devices are grouped into sets by:
  *      - normalized device name with L/R side markers stripped
@@ -19,154 +19,68 @@
  *      - MAC OUI prefix match as a weak corroborator
  *    No brand-specific logic: side detection is name-based; an opportunistic
  *    read of the HAP side characteristic happens later at connect time in
- *    DeviceScreen (not here).
+ *    DeviceScreen (not here). The same heuristics back the lazy sibling
+ *    window (findSetSibling) used when a single device is tapped.
  */
-import { getBleManager } from './BleManager';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import type { DiscoveredDevice } from './types';
 
 /** Standardized MFi / LEA hearing-aid control service (MFI_SPEC.md §1.1) */
 export const LEA_SERVICE_UUID = '7d74f4bd-c74a-4431-862c-cce884371592';
 
-const DIS_SERVICE = '0000180a-0000-1000-8000-00805f9b34fb';
-const DIS_MANUFACTURER_NAME = '00002a29-0000-1000-8000-00805f9b34fb';
+/** AsyncStorage key for the persisted set of LEA-verified device ids. */
+const VERIFIED_STORAGE_KEY = '@mfi_verified';
 
-const CONNECT_TIMEOUT_MS = 6000;
-const DISCOVERY_TIMEOUT_MS = 8000;
-
-/** Candidates weaker than this are not worth a verification connection. */
-const MIN_VERIFY_RSSI = -85;
-
-/** Max background verifications per scan session (bounded BLE churn). */
-export const MAX_VERIFICATIONS_PER_SCAN = 10;
-
-// ── Stage 1: advertised LEA check ──
+// ── Fast-list criteria ──
 
 export function advertisesLeaService(serviceUUIDs: readonly string[]): boolean {
   const target = LEA_SERVICE_UUID.replace(/-/g, '');
   return serviceUUIDs.some((u) => u.toLowerCase().replace(/-/g, '') === target);
 }
 
-// ── Stage 2: connect + verify ──
+// ── Persisted verified-MFi set ──
 
-type Verdict = 'verified' | 'rejected';
-const verdictCache = new Map<string, Verdict>();
+/** Session cache of verified ids, hydrated from AsyncStorage. */
+const verifiedIds = new Set<string>();
+let verifiedLoaded = false;
 
-export function getCachedVerdict(deviceId: string): Verdict | undefined {
-  return verdictCache.get(deviceId.toUpperCase());
-}
-
-export interface MfiVerification {
-  ok: boolean;
-  manufacturer: string | null;
-}
-
-function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    const t = setTimeout(() => reject(new Error(`${label} timed out`)), ms);
-    p.then(
-      (v) => {
-        clearTimeout(t);
-        resolve(v);
-      },
-      (e) => {
-        clearTimeout(t);
-        reject(e);
-      },
-    );
-  });
-}
-
-const B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
-
-function base64ToUtf8(base64: string): string {
-  const clean = base64.replace(/=+$/, '');
-  let bits = 0;
-  let collected = 0;
-  let out = '';
-  for (const ch of clean) {
-    const val = B64.indexOf(ch);
-    if (val < 0) continue;
-    bits = (bits << 6) | val;
-    collected += 6;
-    if (collected >= 8) {
-      collected -= 8;
-      const b = (bits >> collected) & 0xff;
-      if (b === 0) break;
-      out += String.fromCharCode(b);
-    }
-  }
+/**
+ * Load the persisted verified-MFi set into the session cache.
+ * Safe to call repeatedly; only reads storage once.
+ */
+export async function initVerifiedMfiSet(): Promise<void> {
+  if (verifiedLoaded) return;
+  verifiedLoaded = true;
   try {
-    return decodeURIComponent(escape(out)).trim();
+    const raw = await AsyncStorage.getItem(VERIFIED_STORAGE_KEY);
+    if (raw) {
+      const ids = JSON.parse(raw) as string[];
+      for (const id of ids) verifiedIds.add(id.toUpperCase());
+    }
   } catch {
-    return out.trim();
+    // Corrupt/missing storage — start empty
   }
+}
+
+/** True if this device id was previously confirmed to expose the LEA service. */
+export function isVerifiedMfi(deviceId: string): boolean {
+  return verifiedIds.has(deviceId.toUpperCase());
 }
 
 /**
- * Stage-2 verification: briefly connect and check for the LEA service.
- * Safe on already-connected devices (never tears down an active connection).
- * Result is cached for the app session.
+ * Record a successful LEA-service confirmation (piggybacked on a real connect
+ * flow). Updates the session cache and persists to AsyncStorage.
  */
-export async function verifyMfiDevice(deviceId: string): Promise<MfiVerification> {
+export function markVerifiedMfi(deviceId: string): void {
   const id = deviceId.toUpperCase();
-  const cached = verdictCache.get(id);
-  if (cached) return { ok: cached === 'verified', manufacturer: null };
-
-  const manager = getBleManager();
-  let ok = false;
-  let manufacturer: string | null = null;
-  let wasConnected = false;
-
-  try {
-    wasConnected = await manager.isDeviceConnected(id).catch(() => false);
-    const device = await withTimeout(
-      manager.connectToDevice(id),
-      CONNECT_TIMEOUT_MS,
-      'verify connect',
-    );
-    await withTimeout(
-      device.discoverAllServicesAndCharacteristics(),
-      DISCOVERY_TIMEOUT_MS,
-      'verify discovery',
-    );
-    const services = await device.services();
-    ok = services.some((s) => s.uuid.toLowerCase() === LEA_SERVICE_UUID);
-
-    if (ok) {
-      try {
-        const char = await device.readCharacteristicForService(
-          DIS_SERVICE,
-          DIS_MANUFACTURER_NAME,
-        );
-        if (char.value) manufacturer = base64ToUtf8(char.value) || null;
-      } catch {
-        // DIS is optional
-      }
-    }
-  } catch {
-    ok = false;
-  } finally {
-    if (!wasConnected) {
-      try {
-        await manager.cancelDeviceConnection(id);
-      } catch {
-        // already gone
-      }
-    }
-  }
-
-  verdictCache.set(id, ok ? 'verified' : 'rejected');
-  return { ok, manufacturer };
-}
-
-/** True if a scanned device is worth a stage-2 verification attempt. */
-export function isVerificationCandidate(device: DiscoveredDevice): boolean {
-  if (getCachedVerdict(device.id)) return false;
-  if (device.serviceUUIDs.length > 0 && advertisesLeaService(device.serviceUUIDs)) {
-    return false; // already passes stage 1
-  }
-  if (device.rssi != null && device.rssi < MIN_VERIFY_RSSI) return false;
-  return true;
+  if (verifiedIds.has(id)) return;
+  verifiedIds.add(id);
+  void AsyncStorage.setItem(
+    VERIFIED_STORAGE_KEY,
+    JSON.stringify(Array.from(verifiedIds)),
+  ).catch(() => {
+    // persistence failure is non-fatal — session cache still holds it
+  });
 }
 
 // ── Binaural set grouping ──
@@ -328,4 +242,22 @@ function makeSetEntry(a: DiscoveredDevice, b: DiscoveredDevice): DiscoveredDevic
       [b.id]: b.name,
     },
   };
+}
+
+/**
+ * Lazy sibling window (TASK16): given a tapped single device and raw scan
+ * results collected during the post-tap window, find its binaural sibling
+ * using the same grouping heuristics as buildMfiSetEntries.
+ * Returns a merged set entry (ready for the dual connect flow) or null.
+ */
+export function findSetSibling(
+  device: DiscoveredDevice,
+  candidates: DiscoveredDevice[],
+): DiscoveredDevice | null {
+  const pool = candidates.filter((c) => c.id !== device.id);
+  if (pool.length === 0) return null;
+  const set = buildMfiSetEntries([device, ...pool]).find(
+    (e) => e.setMemberIds?.length === 2 && e.setMemberIds.includes(device.id),
+  );
+  return set ?? null;
 }

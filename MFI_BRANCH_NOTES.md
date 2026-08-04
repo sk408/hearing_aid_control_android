@@ -282,6 +282,8 @@ Smoke-test checklist (ReSound Lacerta aids expose the LEA service — March
 - Command: `cd android && gradlew.bat assembleRelease` (`build_app.bat`
   does not exist in the repo)
 - APK path: `android/app/build/outputs/apk/release/app-release.apk`
+- TASK16 rebuild: **BUILD SUCCESSFUL** (2026-08-04, 82,364,946 bytes) —
+  `tsc --noEmit` clean; fast-list scan + lazy sibling window.
 - TASK14 rebuild: **BUILD SUCCESSFUL** (2026-08-04, 82,366,442 bytes) —
   `tsc --noEmit` clean; all 5 adapters still present, brand adapters
   byte-identical to main.
@@ -291,3 +293,57 @@ Smoke-test checklist (ReSound Lacerta aids expose the LEA service — March
 
 Single branch commit containing only the MFi additions listed above. Not
 pushed (per task: push only if it builds clean).
+
+---
+
+# TASK16 — Fast-list scan + lazy sibling window (2026-08-04)
+
+## Problem
+
+TASK14 verified unknown scan candidates by SEQUENTIALLY CONNECTING to each
+one during the scan flow (6s connect + 8s discovery timeouts, up to 10
+devices). Device enumeration was perceptibly slow.
+
+## Change
+
+1. **Fast list** — during scanning a device now appears in the list
+   immediately when (a) its advertised service UUIDs include the LEA service
+   `7d74f4bd-…`, or (b) its device id is in the persisted verified-MFi set
+   (AsyncStorage key `@mfi_verified`). Ids are added to that set after any
+   successful LEA-service confirmation during a real connect flow.
+2. **Eager connect-verification removed** — the stage-2 probe
+   (`verifyMfiDevice`, `isVerificationCandidate`,
+   `MAX_VERIFICATIONS_PER_SCAN`, verdict cache) is gone from `mfiSets.ts` and
+   `HomeScreen.tsx`. Unknown candidates are never connected-to during scan;
+   they simply do not appear (list stays MFi-only).
+3. **Lazy sibling window** — tapping a listed single device keeps BLE
+   scanning running in the background for 10s with a "Looking for the other
+   ear…" indicator. Scan results (including pre-tap results held in
+   `allScannedRef`) are matched with the existing grouping heuristics via the
+   new `findSetSibling()` in `mfiSets.ts`. Sibling found → merged set entry →
+   existing dual connect/bond set flow in `DeviceScreen`. No sibling after
+   10s → single-sided connect. Already-grouped "L+R" set entries still
+   navigate straight into the dual flow with no window.
+4. **Piggyback verification only** — LEA-service confirmation now happens
+   exclusively inside real connect flows (`piggybackVerifyLea` in
+   `DeviceScreen.tsx`, called after single-device service discovery and after
+   `MfiAdapter.connectSet` for both set members). Successful confirmations
+   call `markVerifiedMfi()`, which updates the session cache and persists to
+   AsyncStorage. No standalone probes remain.
+
+## Files touched
+
+- `src/ble/mfiSets.ts` — stage-2 verification deleted; added
+  `initVerifiedMfiSet` / `isVerifiedMfi` / `markVerifiedMfi` (AsyncStorage
+  `@mfi_verified`) and `findSetSibling`.
+- `src/screens/HomeScreen.tsx` — fast-list scan callback, sibling-window
+  state machine + indicator, bonded devices shown only when verified.
+- `src/screens/DeviceScreen.tsx` — `piggybackVerifyLea` on both connect
+  paths.
+
+## Verification
+
+- `npx tsc --noEmit`: clean.
+- `cd android && gradlew.bat assembleRelease`: see Build section above
+  (TASK16 rebuild recorded there).
+

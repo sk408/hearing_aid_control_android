@@ -232,6 +232,11 @@ export class PhilipsAdapter implements HearingAidAdapter {
       console.log('[PhilipsAdapter] Initiating Android BLE bond...');
       await createBond(deviceId);
       console.log('[PhilipsAdapter] Android bond complete');
+
+      // Re-discover services after bonding — secured characteristics may now be
+      // accessible with updated encryption properties that weren't visible in
+      // pre-bond discovery (Android GATT cache is stale until refresh).
+      await this.device.discoverAllServicesAndCharacteristics();
     } else {
       console.log('[PhilipsAdapter] Already Android-bonded');
     }

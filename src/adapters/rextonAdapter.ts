@@ -49,8 +49,28 @@ import type { DeviceInfo, Feature, Program } from '../ble/types';
 
 const TERMINAL_IO_SERVICE = '8b82105d-0f0c-40bb-b422-3770fa72a864';
 
-/** Basic Control: write [opcode, value] for volume/program/balance/tinnitus/CROS (confirmed) */
-const BASIC_CONTROL_CHAR = '8b8276e8-0f0c-40bb-b422-3770fa72a864';
+/**
+ * Basic Control: write [opcode, value] for volume/program/balance/tinnitus/CROS.
+ *
+ * The decompiled Rexton app (WSA.Foundation.Bluetooth v5.0.4, WSAUD A/S) exposes
+ * this characteristic under three UUID aliases across different HiService parents:
+ *
+ *   8b8276e8  — Terminal IO service (8b82105d)     [most common]
+ *   c8f747ac  — Control/FAPI service (c8f7a831)     [alternative]
+ *   22e01397  — unknown service variant              [alternative]
+ *
+ * The official app resolves dynamically via HiService (which has 6 service UUID
+ * aliases including POLARIS 56772eaf). Our adapter builds a charServiceMap from
+ * live GATT discovery and resolves at write time.
+ */
+const BASIC_CONTROL_UUIDS = [
+  '8b8276e8-0f0c-40bb-b422-3770fa72a864',
+  'c8f747ac-21b2-45b8-87f8-bd49a13eff49',
+  '22e01397-43cb-45b6-a921-b28271e4e989',
+] as const;
+
+/** Legacy alias — the first (most common) Basic Control UUID */
+const BASIC_CONTROL_CHAR = BASIC_CONTROL_UUIDS[0];
 
 /** Program notify: subscribe for active program changes (confirmed) */
 const PROGRAM_NOTIFY_CHAR = '8b8225e0-0f0c-40bb-b422-3770fa72a864';
@@ -220,12 +240,79 @@ export class RextonAdapter implements HearingAidAdapter {
   private programNotifySub: Subscription | null = null;
   private volumeNotifySub: Subscription | null = null;
 
+  /** Characteristic UUID (lowercase) → parent service UUID, built during connect */
+  private charServiceMap = new Map<string, string>();
+
   /** Returns connected device or throws */
   private get connected(): Device {
     if (!this.device) {
       throw new Error('RextonAdapter: not connected — call connect() first');
     }
     return this.device;
+  }
+
+  /**
+   * Build characteristic UUID → parent service UUID map from live GATT discovery.
+   * The decompiled Rexton app (WSA.Foundation.Bluetooth) shows the same logical
+   * characteristic can appear under different services across firmware versions.
+   * Dynamic resolution avoids hardcoding a single service path.
+   */
+  private async buildCharacteristicMap(): Promise<void> {
+    const dev = this.connected;
+    try {
+      const services = await dev.services();
+      for (const service of services) {
+        try {
+          const chars = await service.characteristics();
+          for (const char of chars) {
+            this.charServiceMap.set(char.uuid.toLowerCase(), service.uuid);
+          }
+        } catch {
+          // Some services may not expose readable characteristics
+        }
+      }
+      console.log(
+        `[RextonAdapter] charServiceMap built: ${this.charServiceMap.size} characteristics mapped`,
+      );
+    } catch {
+      console.warn('[RextonAdapter] Service enumeration failed — will use hardcoded service UUIDs');
+    }
+  }
+
+  /**
+   * Find the parent service UUID for a characteristic.
+   * Prefers charServiceMap (live discovery); then falls back to hardcoded
+   * service constants.
+   */
+  private findService(charUUID: string): string {
+    const cached = this.charServiceMap.get(charUUID.toLowerCase());
+    if (cached) return cached;
+
+    // Hardcoded fallbacks for known services
+    if (charUUID.toLowerCase() === BATTERY_LEVEL_CHAR.toLowerCase()) return BATTERY_SERVICE;
+    if (charUUID.toLowerCase() === DIS_FIRMWARE_CHAR.toLowerCase()) return DIS_SERVICE;
+    if (charUUID.toLowerCase() === MAIN_VOLUME_CHAR.toLowerCase()) return POLARIS_SERVICE;
+    if (charUUID.toLowerCase() === POLARIS_PROGRAM_CHAR.toLowerCase()) return POLARIS_SERVICE;
+    if (charUUID.toLowerCase() === OBLE_VOLUME_CHAR.toLowerCase()) return POLARIS_SERVICE;
+    if (charUUID.toLowerCase() === EAR_CHAR.toLowerCase()) return POLARIS_SERVICE;
+    if (charUUID.toLowerCase() === HI_ID_CHAR.toLowerCase()) return POLARIS_SERVICE;
+
+    // Default to Terminal IO for Basic Control and program notify
+    return TERMINAL_IO_SERVICE;
+  }
+
+  /**
+   * Resolve the service for a Basic Control write.
+   * Tries each UUID alias (from decompiled WSA code) until one is found
+   * in the charServiceMap or succeeds on the hardcoded service.
+   */
+  private findBasicControlService(): string {
+    for (const uuid of BASIC_CONTROL_UUIDS) {
+      const cached = this.charServiceMap.get(uuid.toLowerCase());
+      if (cached) return cached;
+    }
+    // Fallback: assume first UUID under Terminal IO
+    return TERMINAL_IO_SERVICE;
   }
 
   async connect(deviceId: string): Promise<void> {
@@ -245,6 +332,9 @@ export class RextonAdapter implements HearingAidAdapter {
     await this.device.discoverAllServicesAndCharacteristics();
     console.log('[RextonAdapter] Service discovery complete');
 
+    // Build characteristic→service map for dynamic service resolution
+    await this.buildCharacteristicMap();
+
     // Ensure Android-level BLE bond before any secured characteristic access.
     // Without this, writes to Terminal IO / POLARIS characteristics fail with
     // "Operation was rejected" on Android 6+.
@@ -253,13 +343,21 @@ export class RextonAdapter implements HearingAidAdapter {
       console.log('[RextonAdapter] Initiating Android BLE bond...');
       await createBond(deviceId);
       console.log('[RextonAdapter] Android bond complete');
+
+      // Re-discover services after bonding — secured characteristics may now be
+      // accessible with updated encryption properties that weren't visible in
+      // pre-bond discovery (Android GATT cache is stale until refresh).
+      await this.device.discoverAllServicesAndCharacteristics();
+      await this.buildCharacteristicMap();
     } else {
       console.log('[RextonAdapter] Already Android-bonded');
     }
 
-    // Subscribe to Terminal IO program change notifications (8b8225e0)
+    // Subscribe to program change notifications.
+    // Try each known service that may host the program notify characteristic.
+    const progNotifyService = this.findService(PROGRAM_NOTIFY_CHAR);
     this.programNotifySub = this.device.monitorCharacteristicForService(
-      TERMINAL_IO_SERVICE,
+      progNotifyService,
       PROGRAM_NOTIFY_CHAR,
       (error, char) => {
         if (error) {
@@ -275,12 +373,13 @@ export class RextonAdapter implements HearingAidAdapter {
       },
     );
 
-    // Subscribe to shared POLARIS main volume char (1454e9d6) for volume state tracking.
-    // Rexton shares this UUID with Philips/Oticon on the POLARIS service.
+    // Subscribe to main volume char for volume state tracking.
     // Format: [level, invMute] where invMute 1=unmuted, 0=muted.
+    // May live under POLARIS (56772eaf) or another HiService alias.
+    const volService = this.findService(MAIN_VOLUME_CHAR);
     try {
       this.volumeNotifySub = this.device.monitorCharacteristicForService(
-        POLARIS_SERVICE,
+        volService,
         MAIN_VOLUME_CHAR,
         (error, char) => {
           if (error || !char?.value) return;
@@ -301,10 +400,11 @@ export class RextonAdapter implements HearingAidAdapter {
       console.log('[RextonAdapter] POLARIS volume subscription not available — using local tracking');
     }
 
-    // Subscribe to shared POLARIS program select char (535442f7) for program state
+    // Subscribe to POLARIS program select char for program state
+    const progService = this.findService(POLARIS_PROGRAM_CHAR);
     try {
       this.device.monitorCharacteristicForService(
-        POLARIS_SERVICE,
+        progService,
         POLARIS_PROGRAM_CHAR,
         (error, char) => {
           if (error || !char?.value) return;
@@ -341,21 +441,40 @@ export class RextonAdapter implements HearingAidAdapter {
       }
       this.device = null;
       this.deviceId = null;
+      this.charServiceMap.clear();
     }
     console.log('[RextonAdapter] Disconnected');
   }
 
-  /** Write [opcode, value] to Terminal IO Basic Control characteristic (8b8276e8) */
+  /**
+   * Write [opcode, value] to Basic Control Command characteristic.
+   *
+   * The decompiled WSA app defines three UUID aliases for this characteristic
+   * (8b8276e8, c8f747ac, 22e01397) across different HiService parents.
+   * We try each alias with its resolved service until one succeeds.
+   */
   private async writeBasicControl(opcode: number, value: number): Promise<void> {
     const dev = this.connected;
+    const payload = bytesToBase64([opcode, value & 0xff]);
     console.log(`[RextonAdapter] BasicControl write: [0x${opcode.toString(16).padStart(2, '0')}, ${value}]`);
-    await withRetry(() =>
-      dev.writeCharacteristicWithResponseForService(
-        TERMINAL_IO_SERVICE,
-        BASIC_CONTROL_CHAR,
-        bytesToBase64([opcode, value & 0xff]),
-      ),
-    );
+
+    let lastError: unknown;
+    for (const uuid of BASIC_CONTROL_UUIDS) {
+      const serviceUUID = this.charServiceMap.get(uuid.toLowerCase()) ?? TERMINAL_IO_SERVICE;
+      try {
+        await withRetry(() =>
+          dev.writeCharacteristicWithResponseForService(
+            serviceUUID,
+            uuid,
+            payload,
+          ),
+        );
+        return;
+      } catch (err) {
+        lastError = err;
+      }
+    }
+    throw lastError;
   }
 
   /**
@@ -366,11 +485,22 @@ export class RextonAdapter implements HearingAidAdapter {
   async setVolume(level: number, _ear?: 'left' | 'right' | 'both'): Promise<void> {
     const dev = this.connected;
     const clamped = Math.max(0, Math.min(100, Math.round(level)));
+    console.log(`[RextonAdapter] setVolume(${clamped})`);
+
+    // Primary: Terminal IO Basic Control (confirmed Rexton-native path)
+    try {
+      await this.writeBasicControl(OP_VOLUME, clamped);
+      this.lastKnownVolume = clamped;
+      return;
+    } catch {
+      console.log('[RextonAdapter] Terminal IO volume write failed, trying POLARIS fallback...');
+    }
+
+    // Fallback: shared POLARIS characteristic (same UUID as Philips/Oticon)
     const payload = [clamped & 0xFF, (clamped >> 8) & 0xFF, 1, 0];
-    console.log(`[RextonAdapter] setVolume(${clamped}) -> [${payload.join(', ')}]`);
     await withRetry(() =>
       dev.writeCharacteristicWithoutResponseForService(
-        POLARIS_SERVICE,
+        this.findService(MAIN_VOLUME_CHAR),
         MAIN_VOLUME_CHAR,
         bytesToBase64(payload),
       ),
@@ -389,7 +519,7 @@ export class RextonAdapter implements HearingAidAdapter {
     const dev = this.connected;
     try {
       const char = await withRetry(() =>
-        dev.readCharacteristicForService(POLARIS_SERVICE, MAIN_VOLUME_CHAR),
+        dev.readCharacteristicForService(this.findService(MAIN_VOLUME_CHAR), MAIN_VOLUME_CHAR),
       );
       if (char.value) {
         const bytes = base64ToBytes(char.value);
@@ -429,7 +559,7 @@ export class RextonAdapter implements HearingAidAdapter {
     }
     await withRetry(() =>
       dev.writeCharacteristicWithoutResponseForService(
-        POLARIS_SERVICE,
+        this.findService(MAIN_VOLUME_CHAR),
         MAIN_VOLUME_CHAR,
         bytesToBase64(payload),
       ),
@@ -448,9 +578,20 @@ export class RextonAdapter implements HearingAidAdapter {
   async setProgram(index: number): Promise<void> {
     const dev = this.connected;
     console.log(`[RextonAdapter] setProgram(${index})`);
+
+    // Primary: Terminal IO Basic Control (confirmed Rexton-native path)
+    try {
+      await this.writeBasicControl(OP_PROGRAM, index & 0xFF);
+      this.lastKnownProgram = index;
+      return;
+    } catch {
+      console.log('[RextonAdapter] Terminal IO program write failed, trying POLARIS fallback...');
+    }
+
+    // Fallback: shared POLARIS characteristic (same UUID as Philips/Oticon)
     await withRetry(() =>
       dev.writeCharacteristicWithoutResponseForService(
-        POLARIS_SERVICE,
+        this.findService(POLARIS_PROGRAM_CHAR),
         POLARIS_PROGRAM_CHAR,
         bytesToBase64([index & 0xFF]),
       ),
@@ -527,10 +668,10 @@ export class RextonAdapter implements HearingAidAdapter {
       // DIS may not be readable without bond on Rexton devices
     }
 
-    // Try to read ear side from shared POLARIS characteristic
+    // Try to read ear side
     try {
       const earChar = await withRetry(() =>
-        dev.readCharacteristicForService(POLARIS_SERVICE, EAR_CHAR),
+        dev.readCharacteristicForService(this.findService(EAR_CHAR), EAR_CHAR),
       );
       if (earChar.value) {
         const bytes = base64ToBytes(earChar.value);
@@ -571,7 +712,7 @@ export class RextonAdapter implements HearingAidAdapter {
     const payload = clamped > 0 ? [clamped - 1, 0x01] : [0x00, 0x00];
     await withRetry(() =>
       dev.writeCharacteristicWithoutResponseForService(
-        POLARIS_SERVICE,
+        this.findService(OBLE_VOLUME_CHAR),
         OBLE_VOLUME_CHAR,
         bytesToBase64(payload),
       ),

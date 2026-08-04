@@ -27,6 +27,7 @@ import { MfiAdapter } from '../adapters/mfiAdapter';
 import { useDeviceStore } from '../store/deviceStore';
 import type { EarSide } from '../store/deviceStore';
 import type { HearingAidAdapter } from '../adapters/types';
+import { LEA_SERVICE_UUID, markVerifiedMfi } from '../ble/mfiSets';
 
 type DeviceScreenProps = {
   route: RouteProp<{ Device: { device: DiscoveredDevice } }, 'Device'>;
@@ -120,6 +121,29 @@ function isMacPrefixMatch(mac1: string, mac2: string): boolean {
   return normalize(mac1) === normalize(mac2);
 }
 
+/**
+ * Piggyback LEA verification (TASK16): the ONLY place MFi verification
+ * happens is inside a real connect flow. If the connected device exposes the
+ * LEA service, its id is added to the persisted verified set so future scans
+ * fast-list it immediately.
+ */
+async function piggybackVerifyLea(deviceId: string, svcUuids: string[]): Promise<void> {
+  if (svcUuids.length > 0) {
+    if (svcUuids.some((u) => u.toLowerCase() === LEA_SERVICE_UUID)) {
+      markVerifiedMfi(deviceId);
+    }
+    return;
+  }
+  try {
+    const services = await getBleManager().servicesForDevice(deviceId);
+    if (services.some((s) => s.uuid.toLowerCase() === LEA_SERVICE_UUID)) {
+      markVerifiedMfi(deviceId);
+    }
+  } catch {
+    // verification is best-effort; connect flow continues regardless
+  }
+}
+
 export function DeviceScreen({ route }: DeviceScreenProps) {
   const { device } = route.params;
   const navigation = useNavigation<StackNavigationProp<RootStackParamList>>();
@@ -202,6 +226,11 @@ export function DeviceScreen({ route }: DeviceScreenProps) {
 
       const nameSides = device.memberSides ?? {};
       await adapter.connectSet(primaryId, secondaryId, nameSides[primaryId] ?? 'right');
+
+      // Piggyback verification (TASK16): both aids were connected anyway —
+      // record LEA confirmation for each so future scans fast-list them.
+      void piggybackVerifyLea(primaryId, []);
+      if (adapter.isSet) void piggybackVerifyLea(secondaryId, []);
 
       // Refine sides via the HAP side characteristic when names gave no hint
       if (!nameSides[primaryId]) {
@@ -295,6 +324,10 @@ export function DeviceScreen({ route }: DeviceScreenProps) {
       const services = await discovered.services();
       const svcUuids = services.map((s) => s.uuid);
       setServiceUUIDs(svcUuids);
+
+      // Piggyback verification (TASK16): record LEA confirmation now that
+      // we've connected anyway — future scans fast-list this device.
+      void piggybackVerifyLea(device.id, svcUuids);
 
       // Build a map from char UUID → service UUID for side reading
       const charServiceMap = new Map<string, string>();

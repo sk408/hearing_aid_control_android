@@ -268,6 +268,12 @@ export class ResoundAdapter implements HearingAidAdapter {
       this.onAndroidBondingRequired?.(); // inform UI that pairing dialog may appear
       await createBond(deviceId); // waits up to 60s for BOND_BONDED, throws on reject
       console.log('[ResoundAdapter] Android bond complete');
+
+      // Re-discover services after bonding — secured characteristics may now be
+      // accessible with updated encryption properties that weren't visible in
+      // pre-bond discovery (Android GATT cache is stale until refresh).
+      await this.device.discoverAllServicesAndCharacteristics();
+      await this.buildCharacteristicMap();
     } else {
       console.log('[ResoundAdapter] Already Android-bonded');
     }
@@ -288,7 +294,19 @@ export class ResoundAdapter implements HearingAidAdapter {
         await this.createTrustedBondBoot();
       }
     } catch (e) {
-      console.warn('[ResoundAdapter] Trust handshake failed (plaintext fallback):', e);
+      console.error(
+        '[ResoundAdapter] GN trust handshake failed — encrypted writes unavailable.',
+        'Volume/program control may not work on firmware requiring encryption. Error:',
+        e,
+      );
+    }
+
+    // Enumerate GN handles so command frames ([0x03, handle, ...]) are routed
+    // correctly by the hearing instrument firmware.
+    try {
+      await this.discover();
+    } catch (e) {
+      console.warn('[RextonAdapter] GN discover failed (non-fatal):', e);
     }
   }
 

@@ -19,10 +19,9 @@ import { startScan, getBondedDevices } from '../ble/scanner';
 import {
   advertisesLeaService,
   buildMfiSetEntries,
-  getCachedVerdict,
-  isVerificationCandidate,
-  verifyMfiDevice,
-  MAX_VERIFICATIONS_PER_SCAN,
+  findSetSibling,
+  initVerifiedMfiSet,
+  isVerifiedMfi,
 } from '../ble/mfiSets';
 import type { DiscoveredDevice } from '../ble/types';
 import type { StackNavigationProp } from '@react-navigation/stack';
@@ -141,71 +140,74 @@ export function HomeScreen({ navigation }: HomeScreenProps) {
     setDeviceSlot,
   } = useDeviceStore();
   const stopScanRef = useRef<(() => void) | null>(null);
+  const autoStopTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // Stage-2 filter state: scanned devices that don't advertise the LEA UUID
-  // are collected here and verified (brief connect + service discovery) after
-  // the scan stops. Only verified MFi devices ever enter the list (TASK14).
-  const candidatesRef = useRef(new Map<string, DiscoveredDevice>());
-  const verifyingRef = useRef(false);
-  const [verifyingCount, setVerifyingCount] = useState(0);
+  // Lazy sibling window (TASK16): after a single device is tapped, scanning
+  // continues in the background for up to 10s while we watch scan results
+  // for the binaural sibling (grouping heuristics in mfiSets.findSetSibling).
+  const SIBLING_WINDOW_MS = 10000;
+  const siblingTargetRef = useRef<DiscoveredDevice | null>(null);
+  const siblingCandidatesRef = useRef(new Map<string, DiscoveredDevice>());
+  const siblingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [lookingForSibling, setLookingForSibling] = useState(false);
+  // Every scan callback result (listed or not) — seeds the sibling window so
+  // a sibling that appeared before the tap can still be matched.
+  const allScannedRef = useRef(new Map<string, DiscoveredDevice>());
 
   /**
-   * Stage-2 verification: connect briefly to each candidate and check for the
-   * LEA service. Verified devices are added to the list as 'mfi'; the rest
-   * are hidden permanently (session-cached verdict in mfiSets).
+   * Fast-list criteria (TASK16): a device appears immediately if it
+   * advertises the LEA service UUID or was LEA-verified on a prior connect
+   * (persisted set). Unknown candidates are never connected-to during scan.
    */
-  const runVerification = useCallback(async () => {
-    if (verifyingRef.current) return;
-    verifyingRef.current = true;
-    try {
-      const { leftDevice: left, rightDevice: right } = useDeviceStore.getState();
-      const connectedIds = new Set(
-        [left?.deviceId, right?.deviceId].filter(Boolean) as string[],
-      );
-      const candidates = Array.from(candidatesRef.current.values())
-        .filter((d) => !connectedIds.has(d.id) && isVerificationCandidate(d))
-        .sort((a, b) => (b.rssi ?? -999) - (a.rssi ?? -999))
-        .slice(0, MAX_VERIFICATIONS_PER_SCAN);
+  const passesFastList = useCallback(
+    (d: DiscoveredDevice) =>
+      d.brand === 'mfi' || advertisesLeaService(d.serviceUUIDs) || isVerifiedMfi(d.id),
+    [],
+  );
 
-      setVerifyingCount(candidates.length);
-      for (const candidate of candidates) {
-        candidatesRef.current.delete(candidate.id);
-        setVerifyingCount((n) => Math.max(0, n - 1));
-        try {
-          const result = await verifyMfiDevice(candidate.id);
-          if (result.ok) {
-            addDiscoveredDevice({
-              ...candidate,
-              brand: 'mfi',
-              name:
-                candidate.name ??
-                (result.manufacturer
-                  ? `MFi hearing aid (${result.manufacturer})`
-                  : 'MFi hearing aid'),
-            });
-          }
-        } catch {
-          // verification failure — device stays hidden
-        }
-      }
-    } finally {
-      verifyingRef.current = false;
-      setVerifyingCount(0);
-    }
-  }, [addDiscoveredDevice]);
-
-  const stopScanAndVerify = useCallback(() => {
+  const stopScan = useCallback(() => {
     if (stopScanRef.current) {
       stopScanRef.current();
       stopScanRef.current = null;
     }
+    if (autoStopTimerRef.current) {
+      clearTimeout(autoStopTimerRef.current);
+      autoStopTimerRef.current = null;
+    }
     setScanning(false);
-    void runVerification();
-  }, [setScanning, runVerification]);
+  }, [setScanning]);
+
+  /** End the sibling window: stop scanning and navigate with the outcome. */
+  const finishSiblingWindow = useCallback(
+    (outcome: DiscoveredDevice) => {
+      if (siblingTimerRef.current) {
+        clearTimeout(siblingTimerRef.current);
+        siblingTimerRef.current = null;
+      }
+      siblingTargetRef.current = null;
+      siblingCandidatesRef.current.clear();
+      setLookingForSibling(false);
+      stopScan();
+      navigation.navigate('Device', { device: outcome });
+    },
+    [navigation, stopScan],
+  );
+
+  /** Cancel the sibling window without navigating (user stopped the scan). */
+  const cancelSiblingWindow = useCallback(() => {
+    if (siblingTimerRef.current) {
+      clearTimeout(siblingTimerRef.current);
+      siblingTimerRef.current = null;
+    }
+    siblingTargetRef.current = null;
+    siblingCandidatesRef.current.clear();
+    setLookingForSibling(false);
+  }, []);
 
   const handleScan = useCallback(async () => {
     if (isScanning) {
-      stopScanAndVerify();
+      cancelSiblingWindow();
+      stopScan();
       return;
     }
 
@@ -213,66 +215,74 @@ export function HomeScreen({ navigation }: HomeScreenProps) {
     if (!granted) return;
 
     clearDiscoveredDevices();
-    candidatesRef.current.clear();
+    allScannedRef.current.clear();
+    await initVerifiedMfiSet();
     setScanning(true);
 
-    // Re-verify OS-paired BLE devices — only MFi ones are shown
+    // OS-paired BLE devices previously confirmed as MFi show immediately
     try {
       const bonded = await getBondedDevices();
       for (const d of bonded) {
-        const verdict = getCachedVerdict(d.id);
-        if (verdict === 'verified') {
+        if (isVerifiedMfi(d.id) || advertisesLeaService(d.serviceUUIDs)) {
           addDiscoveredDevice({ ...d, brand: 'mfi' });
-        } else if (verdict !== 'rejected') {
-          candidatesRef.current.set(d.id, d);
         }
       }
-      void runVerification();
     } catch {
       // ignore
     }
 
     stopScanRef.current = startScan((device) => {
-      // Stage 1: devices advertising the LEA service UUID show immediately.
-      if (device.brand === 'mfi' || advertisesLeaService(device.serviceUUIDs)) {
+      allScannedRef.current.set(device.id, device);
+      // Fast list: LEA advertisers and previously verified MFi devices only.
+      if (passesFastList(device)) {
         addDiscoveredDevice({ ...device, brand: 'mfi' });
-        return;
       }
-      // Everything else: stage-2 candidate, verified after scan stops.
-      candidatesRef.current.set(device.id, device);
+      // Lazy sibling window: watch ALL scan results for the tapped aid's
+      // binaural sibling (unknown candidates are never listed, but the
+      // sibling check is name/RSSI-based so it can still spot them).
+      const target = siblingTargetRef.current;
+      if (target && device.id !== target.id) {
+        siblingCandidatesRef.current.set(device.id, device);
+        const set = findSetSibling(
+          target,
+          Array.from(siblingCandidatesRef.current.values()),
+        );
+        if (set) {
+          finishSiblingWindow({ ...set, brand: 'mfi' });
+        }
+      }
     });
 
-    // Auto-stop after 15 seconds
-    setTimeout(() => {
-      if (stopScanRef.current) {
-        stopScanAndVerify();
+    // Auto-stop after 15 seconds (not while a sibling window is active)
+    autoStopTimerRef.current = setTimeout(() => {
+      if (stopScanRef.current && !siblingTargetRef.current) {
+        stopScan();
       }
     }, 15000);
-  }, [isScanning, setScanning, addDiscoveredDevice, clearDiscoveredDevices, stopScanAndVerify, runVerification]);
+  }, [isScanning, setScanning, addDiscoveredDevice, clearDiscoveredDevices, stopScan, cancelSiblingWindow, finishSiblingWindow, passesFastList]);
 
-  // Load already-bonded MFi devices on mount (verified via stage 2)
+  // Load already-bonded MFi devices on mount (persisted verified set only)
   useEffect(() => {
     void (async () => {
       try {
+        await initVerifiedMfiSet();
         const bonded = await getBondedDevices();
         for (const d of bonded) {
-          const verdict = getCachedVerdict(d.id);
-          if (verdict === 'verified') {
+          if (isVerifiedMfi(d.id) || advertisesLeaService(d.serviceUUIDs)) {
             addDiscoveredDevice({ ...d, brand: 'mfi' });
-          } else if (verdict !== 'rejected') {
-            candidatesRef.current.set(d.id, d);
           }
         }
-        void runVerification();
       } catch {
         // Bonded device query may fail if BLE not ready
       }
     })();
-  }, [addDiscoveredDevice, runVerification]);
+  }, [addDiscoveredDevice]);
 
   useEffect(() => {
     return () => {
       stopScanRef.current?.();
+      if (autoStopTimerRef.current) clearTimeout(autoStopTimerRef.current);
+      if (siblingTimerRef.current) clearTimeout(siblingTimerRef.current);
     };
   }, []);
 
@@ -316,12 +326,73 @@ export function HomeScreen({ navigation }: HomeScreenProps) {
       ) {
         return;
       }
-      stopScanRef.current?.();
-      stopScanRef.current = null;
-      setScanning(false);
-      navigation.navigate('Device', { device });
+      // Ignore further taps while a sibling window is already running
+      if (siblingTargetRef.current) return;
+
+      // Binaural set entry: connect both aids immediately (existing flow)
+      if ((device.setMemberIds?.length ?? 0) === 2) {
+        stopScan();
+        navigation.navigate('Device', { device });
+        return;
+      }
+
+      // Single device: lazy sibling window (TASK16). Keep scanning in the
+      // background for up to 10s while showing "looking for the other ear…".
+      // If the sibling appears, finishSiblingWindow navigates with a merged
+      // set entry (dual connect flow); otherwise the timer proceeds
+      // single-sided.
+      if (autoStopTimerRef.current) {
+        clearTimeout(autoStopTimerRef.current);
+        autoStopTimerRef.current = null;
+      }
+      siblingTargetRef.current = device;
+      siblingCandidatesRef.current.clear();
+      for (const [id, d] of allScannedRef.current) {
+        if (id !== device.id && !connectedIds.includes(id)) {
+          siblingCandidatesRef.current.set(id, d);
+        }
+      }
+      setLookingForSibling(true);
+
+      // The sibling may already have been scanned before the tap
+      const immediate = findSetSibling(
+        device,
+        Array.from(siblingCandidatesRef.current.values()),
+      );
+      if (immediate) {
+        finishSiblingWindow({ ...immediate, brand: 'mfi' });
+        return;
+      }
+
+      // If no scan is currently running (e.g. tapped a bonded-list entry
+      // after auto-stop), start one so the window has something to watch.
+      if (!stopScanRef.current) {
+        setScanning(true);
+        stopScanRef.current = startScan((scanned) => {
+          allScannedRef.current.set(scanned.id, scanned);
+          if (passesFastList(scanned)) {
+            addDiscoveredDevice({ ...scanned, brand: 'mfi' });
+          }
+          const target = siblingTargetRef.current;
+          if (target && scanned.id !== target.id) {
+            siblingCandidatesRef.current.set(scanned.id, scanned);
+            const set = findSetSibling(
+              target,
+              Array.from(siblingCandidatesRef.current.values()),
+            );
+            if (set) {
+              finishSiblingWindow({ ...set, brand: 'mfi' });
+            }
+          }
+        });
+      }
+
+      siblingTimerRef.current = setTimeout(() => {
+        const target = siblingTargetRef.current;
+        if (target) finishSiblingWindow(target);
+      }, SIBLING_WINDOW_MS);
     },
-    [navigation, setScanning, leftDevice, rightDevice],
+    [navigation, stopScan, finishSiblingWindow, leftDevice, rightDevice, setScanning, addDiscoveredDevice, passesFastList],
   );
 
   const hasAnyConnection = leftDevice != null || rightDevice != null;
@@ -425,12 +496,10 @@ export function HomeScreen({ navigation }: HomeScreenProps) {
         </Text>
       </TouchableOpacity>
 
-      {verifyingCount > 0 && (
+      {lookingForSibling && (
         <View style={styles.verifyRow}>
           <ActivityIndicator size="small" color="#6A5ACD" />
-          <Text style={styles.verifyText}>
-            Verifying MFi devices ({verifyingCount})...
-          </Text>
+          <Text style={styles.verifyText}>Looking for the other ear…</Text>
         </View>
       )}
 
@@ -451,9 +520,7 @@ export function HomeScreen({ navigation }: HomeScreenProps) {
         ListEmptyComponent={
           !isScanning ? (
             <Text style={styles.emptyText}>
-              {verifyingCount > 0
-                ? 'Verifying nearby devices...'
-                : 'Press "Scan for Devices" to find nearby MFi hearing aids'}
+              Press "Scan for Devices" to find nearby MFi hearing aids
             </Text>
           ) : (
             <Text style={styles.emptyText}>Scanning...</Text>
