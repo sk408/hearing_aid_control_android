@@ -132,6 +132,10 @@ export function ControlPanel() {
   const leftAdapter = leftDevice?.adapter ?? null;
   const rightAdapter = rightDevice?.adapter ?? null;
   const bothAdapters = [leftAdapter, rightAdapter].filter(Boolean) as HearingAidAdapter[];
+  // An MFi binaural set shares ONE adapter instance across both slots —
+  // dedupe so linked writes don't execute twice on the same adapter.
+  const uniqueAdapters = Array.from(new Set(bothAdapters));
+  const sharedAdapter = leftAdapter != null && leftAdapter === rightAdapter;
   const hasAny = bothAdapters.length > 0;
   const hasBoth = leftAdapter != null && rightAdapter != null;
 
@@ -207,10 +211,10 @@ export function ControlPanel() {
       setVolume(rounded);
       if (!hasAny) return;
       void runCall('setVolume (both)', setVolumeFb, () =>
-        runOnAdapters(bothAdapters, (a) => a.setVolume(rounded)),
+        runOnAdapters(uniqueAdapters, (a) => a.setVolume(rounded)),
       );
     },
-    [hasAny, bothAdapters, runCall],
+    [hasAny, uniqueAdapters, runCall],
   );
 
   const handleLeftVolumeEnd = useCallback(
@@ -219,7 +223,7 @@ export function ControlPanel() {
       setLeftVolume(rounded);
       if (!leftAdapter) return;
       void runCall('setVolume (left)', setLeftVolumeFb, () =>
-        leftAdapter.setVolume(rounded),
+        leftAdapter.setVolume(rounded, 'left'),
       );
     },
     [leftAdapter, runCall],
@@ -231,7 +235,7 @@ export function ControlPanel() {
       setRightVolume(rounded);
       if (!rightAdapter) return;
       void runCall('setVolume (right)', setRightVolumeFb, () =>
-        rightAdapter.setVolume(rounded),
+        rightAdapter.setVolume(rounded, 'right'),
       );
     },
     [rightAdapter, runCall],
@@ -242,10 +246,10 @@ export function ControlPanel() {
       setMuted(value);
       if (!hasAny) return;
       void runCall('setMute', setMuteFb, () =>
-        runOnAdapters(bothAdapters, (a) => a.setMute(value)),
+        runOnAdapters(uniqueAdapters, (a) => a.setMute(value)),
       );
     },
-    [hasAny, bothAdapters, runCall],
+    [hasAny, uniqueAdapters, runCall],
   );
 
   const handleProgramSelect = useCallback(
@@ -254,10 +258,10 @@ export function ControlPanel() {
       if (!hasAny) return;
       // Programs always sync both aids
       void runCall('setProgram', setProgramFb, () =>
-        runOnAdapters(bothAdapters, (a) => a.setProgram(index)),
+        runOnAdapters(uniqueAdapters, (a) => a.setProgram(index)),
       );
     },
-    [hasAny, bothAdapters, runCall],
+    [hasAny, uniqueAdapters, runCall],
   );
 
   const handleRefresh = useCallback(() => {
@@ -266,13 +270,37 @@ export function ControlPanel() {
       setRefreshFb({ state: 'busy' });
       logBleOp('refreshState', 'in progress...');
       try {
-        if (leftAdapter) {
-          const state = await leftAdapter.refreshState();
-          updateDriverState('left', state);
-        }
-        if (rightAdapter) {
-          const state = await rightAdapter.refreshState();
-          updateDriverState('right', state);
+        if (sharedAdapter && leftAdapter) {
+          // MFi binaural set: one adapter, two aids — refresh both ears
+          const adapter = leftAdapter as HearingAidAdapter & {
+            refreshSetState?: () => Promise<{
+              primary: DriverState;
+              secondary: DriverState;
+            } | null>;
+          };
+          const setState = adapter.refreshSetState
+            ? await adapter.refreshSetState()
+            : null;
+          if (setState) {
+            const primarySide = setState.primary.deviceInfo?.side ?? 'left';
+            updateDriverState(primarySide, setState.primary);
+            updateDriverState(
+              primarySide === 'left' ? 'right' : 'left',
+              setState.secondary,
+            );
+          } else {
+            const state = await leftAdapter.refreshState();
+            updateDriverState('left', state);
+          }
+        } else {
+          if (leftAdapter) {
+            const state = await leftAdapter.refreshState();
+            updateDriverState('left', state);
+          }
+          if (rightAdapter) {
+            const state = await rightAdapter.refreshState();
+            updateDriverState('right', state);
+          }
         }
         logBleOp('refreshState', 'OK');
         setRefreshFb({ state: 'ok' });
@@ -284,7 +312,7 @@ export function ControlPanel() {
         setTimeout(() => setRefreshFb({ state: 'idle' }), 4000);
       }
     })();
-  }, [hasAny, leftAdapter, rightAdapter, updateDriverState, logBleOp]);
+  }, [hasAny, sharedAdapter, leftAdapter, rightAdapter, updateDriverState, logBleOp]);
 
   return (
     <View style={styles.container}>

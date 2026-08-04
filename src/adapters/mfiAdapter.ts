@@ -25,6 +25,17 @@
  *  - Program names: write index to LEAProgramNameSelector, then read
  *    LEAProgramName (60-byte UTF-8) and LEAProgramCategory (spec §3.2).
  *
+ * Binaural sets (TASK14):
+ *  - One adapter can manage TWO GATT connections (a left+right pair) via
+ *    connectSet(). Both aids are bonded + connected; the pair is presented
+ *    as one device in the UI.
+ *  - Binaural aids sync volume/program between ears over their own
+ *    ear-to-ear link, so by default writes go to the PRIMARY aid only and
+ *    the secondary is observed via notifications (see `writeToBoth`).
+ *  - Battery is read from BOTH aids (refreshSetState()).
+ *  - Single-sided operation degrades gracefully: if the secondary fails to
+ *    connect, the adapter continues with the primary alone.
+ *
  * This file intentionally imports NO brand-core code.
  */
 import type { Device, Subscription } from 'react-native-ble-plx';
@@ -148,21 +159,49 @@ async function withRetry<T>(
   throw lastError;
 }
 
+type Ear = 'left' | 'right';
+
+/** One GATT link to a single aid (the adapter can hold two for a set) */
+interface MemberLink {
+  device: Device;
+  id: string;
+  subs: Subscription[];
+  battery: number | null;
+}
+
 // ── Adapter ──
 
 export class MfiAdapter implements HearingAidAdapter {
   readonly brand = 'mfi' as const;
 
+  // Primary aid link (write target by default). `this.device` mirrors
+  // primary.device for the single-aid code paths.
   private device: Device | null = null;
   private deviceId: string | null = null;
 
-  // Notification subscriptions (hardware button presses on the aid)
+  // Secondary aid link (binaural set member) — null in single-sided mode
+  private secondary: MemberLink | null = null;
+
+  /** Ear side of the primary aid (set mode). Default right. */
+  primarySide: Ear = 'right';
+
+  /**
+   * Binaural write policy. Binaural aids sync volume/program over their own
+   * ear-to-ear link, so the default (false) writes to the PRIMARY aid only
+   * and relies on notifications from both aids to observe the result.
+   * Set true for sets that do NOT sync between ears (writes go to both).
+   */
+  writeToBoth = false;
+
+  // Primary notification subscriptions (hardware button presses on the aid)
   private micAttNotifySub: Subscription | null = null;
   private streamAttNotifySub: Subscription | null = null;
   private programNotifySub: Subscription | null = null;
   private batteryNotifySub: Subscription | null = null;
 
-  // Cached state (seeded from reads, kept current by notifications)
+  // Cached state (seeded from reads, kept current by notifications).
+  // In set mode these track the SET state — binaural aids sync between ears,
+  // so notifications from either member update the shared cache.
   private cachedVolume = 50;
   private cachedStreamVolume = 50;
   private cachedMuted = false;
@@ -178,7 +217,7 @@ export class MfiAdapter implements HearingAidAdapter {
   onRebootRequired?: (message: string) => void;
   onAndroidBondingRequired?: () => void;
 
-  /** Returns connected device or throws */
+  /** Returns connected primary device or throws */
   private get connected(): Device {
     if (!this.device) {
       throw new Error('MfiAdapter: not connected — call connect() first');
@@ -186,9 +225,13 @@ export class MfiAdapter implements HearingAidAdapter {
     return this.device;
   }
 
-  /** Read a single-byte LEA characteristic */
-  private async readByte(charUuid: string): Promise<number> {
-    const dev = this.connected;
+  /** True when managing a two-aid binaural set */
+  get isSet(): boolean {
+    return this.secondary != null;
+  }
+
+  /** Read a single-byte LEA characteristic from a specific aid */
+  private async readByteFrom(dev: Device, charUuid: string): Promise<number> {
     const char = await withRetry(() =>
       dev.readCharacteristicForService(LEA_SERVICE, charUuid),
     );
@@ -196,13 +239,38 @@ export class MfiAdapter implements HearingAidAdapter {
     return base64ToBytes(char.value)[0];
   }
 
-  /** Write a single-byte LEA characteristic (Write Request to get error codes) */
-  private async writeByte(charUuid: string, value: number): Promise<void> {
-    const dev = this.connected;
+  /** Write a single-byte LEA characteristic to a specific aid (Write Request) */
+  private async writeByteTo(dev: Device, charUuid: string, value: number): Promise<void> {
     const payload = bytesToBase64([value & 0xff]);
     await withRetry(() =>
       dev.writeCharacteristicWithResponseForService(LEA_SERVICE, charUuid, payload),
     );
+  }
+
+  /** Read from the primary aid */
+  private readByte(charUuid: string): Promise<number> {
+    return this.readByteFrom(this.connected, charUuid);
+  }
+
+  /** Write to the primary aid */
+  private writeByte(charUuid: string, value: number): Promise<void> {
+    return this.writeByteTo(this.connected, charUuid, value);
+  }
+
+  /**
+   * Resolve which aids receive a write for the given ear selector.
+   *  - Single-sided: always the one connected aid.
+   *  - ear 'left'/'right' (unlinked UI sliders): that specific aid.
+   *  - 'both': primary only by default (ear-to-ear link syncs the set), or
+   *    both when writeToBoth is enabled for non-syncing sets.
+   */
+  private writeTargets(ear: 'left' | 'right' | 'both' | undefined): Device[] {
+    const primary = this.connected;
+    if (!this.secondary) return [primary];
+    if (ear === 'left' || ear === 'right') {
+      return [this.primarySide === ear ? primary : this.secondary.device];
+    }
+    return this.writeToBoth ? [primary, this.secondary.device] : [primary];
   }
 
   /**
@@ -232,41 +300,76 @@ export class MfiAdapter implements HearingAidAdapter {
     return (this.availableProgramsMask & (1 << index)) !== 0;
   }
 
-  async connect(deviceId: string): Promise<void> {
+  /**
+   * Connect, bond and verify one aid. Returns the established link.
+   * Shared by primary and secondary connection paths.
+   */
+  private async connectOne(deviceId: string, role: 'primary' | 'secondary'): Promise<MemberLink> {
     const manager = getBleManager();
-    this.deviceId = deviceId;
-    console.log(`[MfiAdapter] Connecting to ${deviceId}...`);
+    console.log(`[MfiAdapter] Connecting ${role} aid ${deviceId}...`);
 
-    this.device = await withRetry(() =>
+    const device = await withRetry(() =>
       manager.connectToDevice(deviceId, { requestMTU: 255 }),
     );
 
-    await this.device.discoverAllServicesAndCharacteristics();
+    await device.discoverAllServicesAndCharacteristics();
 
     // Bond (spec §4.3): LEA control characteristics require an encrypted link.
     // Standard Android createBond() — expect Just Works (no UI) on a fresh aid;
-    // Android 8+ negotiates LESC if the aid offers it. ASHA read-hack and GN
-    // createBond variants are NOT applicable here.
+    // Android 8+ negotiates LESC if the aid offers it.
     const bondState = await getBondState(deviceId);
     if (bondState !== BOND_BONDED) {
-      console.log('[MfiAdapter] Initiating Android BLE bond (Just Works/LESC)...');
+      console.log(`[MfiAdapter] Initiating Android BLE bond for ${role} (Just Works/LESC)...`);
       this.onAndroidBondingRequired?.();
       await createBond(deviceId);
-      console.log('[MfiAdapter] Android bond complete');
+      console.log(`[MfiAdapter] Android bond complete for ${role}`);
       // Re-discover — secured characteristics may not have been visible pre-bond
-      await this.device.discoverAllServicesAndCharacteristics();
+      await device.discoverAllServicesAndCharacteristics();
     } else {
-      console.log('[MfiAdapter] Already Android-bonded');
+      console.log(`[MfiAdapter] ${role} aid already Android-bonded`);
     }
 
     // Verify the LEA service is present
-    const services = await this.device.services();
+    const services = await device.services();
     const hasLea = services.some(
       (s) => s.uuid.toLowerCase() === LEA_SERVICE,
     );
     if (!hasLea) {
-      throw new Error('MfiAdapter: LEA (MFi hearing aid) service not found on this device');
+      try {
+        await device.cancelConnection();
+      } catch {
+        // best effort
+      }
+      throw new Error(`MfiAdapter: LEA (MFi hearing aid) service not found on ${role} device`);
     }
+
+    return { device, id: deviceId, subs: [], battery: null };
+  }
+
+  /** Subscribe to battery notifications for one link */
+  private subscribeBattery(link: MemberLink, onValue: (pct: number) => void): void {
+    try {
+      link.subs.push(
+        link.device.monitorCharacteristicForService(
+          LEA_SERVICE,
+          LEA_BATTERY_LEVEL,
+          (error, char) => {
+            if (error || !char?.value) return;
+            const pct = base64ToBytes(char.value)[0];
+            link.battery = pct;
+            onValue(pct);
+          },
+        ),
+      );
+    } catch {
+      console.log('[MfiAdapter] Battery subscription not available');
+    }
+  }
+
+  async connect(deviceId: string): Promise<void> {
+    this.deviceId = deviceId;
+    const link = await this.connectOne(deviceId, 'primary');
+    this.device = link.device;
 
     // Read DIS manufacturer name for display only (no brand logic — spec task §8)
     try {
@@ -365,14 +468,85 @@ export class MfiAdapter implements HearingAidAdapter {
         (error, char) => {
           if (error || !char?.value) return;
           this.cachedBattery = base64ToBytes(char.value)[0];
-          console.log(`[MfiAdapter] Battery notify: ${this.cachedBattery}%`);
+          console.log(`[MfiAdapter] Battery notify (primary): ${this.cachedBattery}%`);
         },
       );
     } catch {
       console.log('[MfiAdapter] Battery subscription not available');
     }
 
-    console.log('[MfiAdapter] Connection setup complete');
+    console.log('[MfiAdapter] Primary connection setup complete');
+  }
+
+  /**
+   * Connect a binaural set: primary first, then the secondary aid.
+   * If the secondary fails (powered off, out of range), the adapter
+   * continues single-sided with the primary — no exception is thrown for
+   * secondary failures.
+   */
+  async connectSet(
+    primaryId: string,
+    secondaryId: string,
+    primarySide: Ear = 'right',
+  ): Promise<void> {
+    this.primarySide = primarySide;
+    await this.connect(primaryId);
+
+    try {
+      const link = await this.connectOne(secondaryId, 'secondary');
+      this.secondary = link;
+
+      // Seed secondary battery
+      try {
+        link.battery = await this.readByteFrom(link.device, LEA_BATTERY_LEVEL);
+      } catch {
+        console.log('[MfiAdapter] Secondary initial battery read failed');
+      }
+
+      // Observe the secondary aid: battery, plus volume/program notifications
+      // (the set syncs over the ear-to-ear link, so secondary notifications
+      // confirm the primary's writes took effect across both ears).
+      this.subscribeBattery(link, (pct) => {
+        console.log(`[MfiAdapter] Battery notify (secondary): ${pct}%`);
+      });
+      try {
+        link.subs.push(
+          link.device.monitorCharacteristicForService(
+            LEA_SERVICE,
+            LEA_MIC_ATTENUATION,
+            (error, char) => {
+              if (error || !char?.value) return;
+              const att = base64ToBytes(char.value)[0];
+              this.cachedVolume = mfiToVolume(att);
+              console.log(`[MfiAdapter] Mic attenuation notify (secondary): ${att}`);
+            },
+          ),
+        );
+      } catch {
+        console.log('[MfiAdapter] Secondary mic attenuation subscription not available');
+      }
+      try {
+        link.subs.push(
+          link.device.monitorCharacteristicForService(
+            LEA_SERVICE,
+            LEA_CURRENT_ACTIVE_PROGRAM,
+            (error, char) => {
+              if (error || !char?.value) return;
+              this.cachedProgram = base64ToBytes(char.value)[0];
+              console.log(`[MfiAdapter] Program notify (secondary): ${this.cachedProgram}`);
+            },
+          ),
+        );
+      } catch {
+        console.log('[MfiAdapter] Secondary program subscription not available');
+      }
+
+      console.log('[MfiAdapter] Secondary connection setup complete — set active');
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'unknown';
+      console.log(`[MfiAdapter] Secondary aid unavailable (${msg}) — continuing single-sided`);
+      this.secondary = null;
+    }
   }
 
   async disconnect(): Promise<void> {
@@ -389,6 +563,16 @@ export class MfiAdapter implements HearingAidAdapter {
     this.programNotifySub = null;
     this.batteryNotifySub = null;
 
+    if (this.secondary) {
+      for (const sub of this.secondary.subs) sub.remove();
+      try {
+        await this.secondary.device.cancelConnection();
+      } catch {
+        // may already be disconnected
+      }
+      this.secondary = null;
+    }
+
     if (this.device) {
       try {
         await this.device.cancelConnection();
@@ -404,14 +588,19 @@ export class MfiAdapter implements HearingAidAdapter {
    * Set mic-path volume (0–100 UI scale → 1–255 GATT attenuation byte).
    * Spec §3.1: byte is monotonic with loudness; GATT clients may write the
    * full 1–255 range (the 13-step RC table quantizes only the physical RC).
+   *
+   * In set mode: 'left'/'right' writes that specific aid; 'both' (default)
+   * writes the primary only unless writeToBoth is enabled.
    */
-  async setVolume(level: number, _ear?: 'left' | 'right' | 'both'): Promise<void> {
+  async setVolume(level: number, ear?: 'left' | 'right' | 'both'): Promise<void> {
     const att = volumeToMfi(level);
-    await this.writeByte(LEA_MIC_ATTENUATION, att);
+    for (const target of this.writeTargets(ear)) {
+      await this.writeByteTo(target, LEA_MIC_ATTENUATION, att);
+    }
     this.cachedVolume = Math.max(0, Math.min(100, Math.round(level)));
   }
 
-  /** Read mic attenuation from the aid and map to 0–100 */
+  /** Read mic attenuation from the (primary) aid and map to 0–100 */
   async getVolume(): Promise<number> {
     try {
       this.cachedVolume = mfiToVolume(await this.readByte(LEA_MIC_ATTENUATION));
@@ -426,17 +615,24 @@ export class MfiAdapter implements HearingAidAdapter {
    * Mute: store current mic attenuation, write 0.
    * Unmute: restore the stored value (fallback: mid-scale 128).
    * Note: firmware treatment of byte 0 vs 1 is unconfirmed (spec §4.7 #4).
+   * In set mode writes follow the same target policy as setVolume('both').
    */
   async setMute(muted: boolean): Promise<void> {
+    const targets = this.writeTargets('both');
     if (muted) {
       try {
         this.preMuteMicAtt = await this.readByte(LEA_MIC_ATTENUATION);
       } catch {
         this.preMuteMicAtt = volumeToMfi(this.cachedVolume);
       }
-      await this.writeByte(LEA_MIC_ATTENUATION, 0);
+      for (const target of targets) {
+        await this.writeByteTo(target, LEA_MIC_ATTENUATION, 0);
+      }
     } else {
-      await this.writeByte(LEA_MIC_ATTENUATION, this.preMuteMicAtt ?? 128);
+      const restore = this.preMuteMicAtt ?? 128;
+      for (const target of targets) {
+        await this.writeByteTo(target, LEA_MIC_ATTENUATION, restore);
+      }
       this.preMuteMicAtt = null;
     }
     this.cachedMuted = muted;
@@ -449,6 +645,7 @@ export class MfiAdapter implements HearingAidAdapter {
   /**
    * Switch program. Validates the index against the LEAAvailablePrograms
    * bitmask before writing — firmware rejects invalid indices (spec §3.2).
+   * In set mode writes follow the same target policy as setVolume('both').
    */
   async setProgram(index: number): Promise<void> {
     if (this.availableProgramsMask == null) {
@@ -463,11 +660,13 @@ export class MfiAdapter implements HearingAidAdapter {
         `MfiAdapter: program ${index} is not fitted (mask 0x${(this.availableProgramsMask ?? 0).toString(16)})`,
       );
     }
-    await this.writeByte(LEA_CURRENT_ACTIVE_PROGRAM, index);
+    for (const target of this.writeTargets('both')) {
+      await this.writeByteTo(target, LEA_CURRENT_ACTIVE_PROGRAM, index);
+    }
     this.cachedProgram = index;
   }
 
-  /** Read the active program index from the aid */
+  /** Read the active program index from the (primary) aid */
   async getProgram(): Promise<number> {
     try {
       this.cachedProgram = await this.readByte(LEA_CURRENT_ACTIVE_PROGRAM);
@@ -517,7 +716,7 @@ export class MfiAdapter implements HearingAidAdapter {
       : [{ index: 0, name: 'Program 1' }];
   }
 
-  /** Read LEABatteryLevel (0–100). Returns -1 on failure. */
+  /** Read LEABatteryLevel (0–100) from the primary aid. Returns -1 on failure. */
   async getBattery(): Promise<number> {
     try {
       this.cachedBattery = await this.readByte(LEA_BATTERY_LEVEL);
@@ -527,14 +726,39 @@ export class MfiAdapter implements HearingAidAdapter {
     }
   }
 
+  /** Read LEABatteryLevel from the secondary aid (set mode). -1 on failure. */
+  async getBatterySecondary(): Promise<number> {
+    const link = this.secondary;
+    if (!link) return -1;
+    try {
+      link.battery = await this.readByteFrom(link.device, LEA_BATTERY_LEVEL);
+      return link.battery;
+    } catch {
+      return link.battery ?? -1;
+    }
+  }
+
   /**
    * Set streaming-path volume (0–100 UI scale → 1–255 GATT byte).
    * Applies while the aid is streaming (spec §3.1).
    */
   async setStreamingVolume(level: number): Promise<void> {
     const att = volumeToMfi(level);
-    await this.writeByte(LEA_STREAM_ATTENUATION, att);
+    for (const target of this.writeTargets('both')) {
+      await this.writeByteTo(target, LEA_STREAM_ATTENUATION, att);
+    }
     this.cachedStreamVolume = Math.max(0, Math.min(100, Math.round(level)));
+  }
+
+  private buildDeviceInfo(id: string, side?: Ear): DeviceInfo {
+    return {
+      id,
+      name: this.manufacturerName
+        ? `MFi hearing aid (${this.manufacturerName})`
+        : 'MFi hearing aid',
+      brand: 'mfi',
+      ...(side ? { side } : {}),
+    };
   }
 
   async refreshState(): Promise<DriverState> {
@@ -546,14 +770,15 @@ export class MfiAdapter implements HearingAidAdapter {
 
     let deviceInfo: DeviceInfo | undefined;
     if (this.device) {
-      deviceInfo = {
-        id: this.deviceId!,
-        name: this.manufacturerName
-          ? `MFi hearing aid (${this.manufacturerName})`
-          : 'MFi hearing aid',
-        brand: 'mfi',
-      };
+      deviceInfo = this.buildDeviceInfo(
+        this.deviceId!,
+        this.secondary ? this.primarySide : undefined,
+      );
     }
+
+    const secondaryBattery = this.secondary
+      ? await this.getBatterySecondary().catch(() => -1)
+      : -1;
 
     return {
       volume,
@@ -563,8 +788,49 @@ export class MfiAdapter implements HearingAidAdapter {
         batteryPercent !== undefined && batteryPercent >= 0
           ? batteryPercent
           : undefined,
+      batteryPercentSecondary:
+        secondaryBattery >= 0 ? secondaryBattery : undefined,
       deviceInfo,
     };
+  }
+
+  /**
+   * Set mode: refresh both aids and return per-ear driver states, keyed by
+   * role. The caller maps them to UI slots via deviceInfo.side.
+   * Returns null when not in set mode.
+   */
+  async refreshSetState(): Promise<{ primary: DriverState; secondary: DriverState } | null> {
+    const link = this.secondary;
+    if (!link || !this.device) return null;
+
+    const [volume, activeProgram, primaryBattery, secondaryBattery] = await Promise.all([
+      this.getVolume().catch(() => undefined),
+      this.getProgram().catch(() => undefined),
+      this.getBattery().catch(() => -1),
+      this.getBatterySecondary().catch(() => -1),
+    ]);
+
+    const secondarySide: Ear = this.primarySide === 'left' ? 'right' : 'left';
+
+    const primary: DriverState = {
+      volume,
+      muted: this.cachedMuted,
+      activeProgram,
+      batteryPercent: primaryBattery >= 0 ? primaryBattery : undefined,
+      batteryPercentSecondary: secondaryBattery >= 0 ? secondaryBattery : undefined,
+      deviceInfo: this.buildDeviceInfo(this.deviceId!, this.primarySide),
+    };
+
+    const secondary: DriverState = {
+      volume,
+      muted: this.cachedMuted,
+      activeProgram,
+      batteryPercent: secondaryBattery >= 0 ? secondaryBattery : undefined,
+      batteryPercentSecondary: primaryBattery >= 0 ? primaryBattery : undefined,
+      deviceInfo: this.buildDeviceInfo(link.id, secondarySide),
+    };
+
+    return { primary, secondary };
   }
 
   getSupportedFeatures(): Feature[] {

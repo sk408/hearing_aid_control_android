@@ -10,6 +10,11 @@ export interface DriverState {
   readonly muted?: boolean;
   readonly activeProgram?: number;
   readonly batteryPercent?: number;
+  /**
+   * Battery of the secondary aid in a binaural set (MFi adapter only).
+   * Present when one adapter manages two GATT connections.
+   */
+  readonly batteryPercentSecondary?: number;
   readonly deviceInfo?: DeviceInfo;
 }
 

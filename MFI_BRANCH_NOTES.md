@@ -2,6 +2,137 @@
 
 Branch: `feature/mfi-control` (from `main` @ d6abce4)
 Date: 2026-08-04
+Tasks: TASK13 — MFi-only control branch. TASK14 — MFi adapter polish:
+MFi-only device filter + auto-pairing of binaural sets.
+
+---
+
+## TASK14 — what changed (2026-08-04, second session)
+
+Two user-requested improvements after the TASK13 live test PASSED on
+ReSound aids. All changes are MFi-adapter-scoped; the 4 brand adapters
+remain byte-identical to main.
+
+### New files
+- `src/ble/mfiSets.ts` — two-stage MFi device filter + brand-agnostic
+  binaural set grouping.
+
+### Edited files
+- `src/ble/types.ts` — additive: `setMemberIds` / `memberSides` /
+  `memberNames` on `DiscoveredDevice`.
+- `src/adapters/types.ts` — additive: `batteryPercentSecondary` on
+  `DriverState`.
+- `src/adapters/mfiAdapter.ts` — dual GATT connections (binaural sets).
+- `src/screens/HomeScreen.tsx` — MFi-only device list, two-stage
+  verification, set list entries, shared-adapter disconnect handling.
+- `src/screens/DeviceScreen.tsx` — set connect flow (`connectMfiSet`),
+  `connecting_set` / `slot_conflict` UI states.
+- `src/screens/ControlPanel.tsx` — deduped shared adapter (one write per
+  linked control), per-ear volume sliders in unlinked mode, set-aware
+  refresh.
+
+### 1. MFi-only device filter (two-stage)
+
+MFI_SPEC.md §4.4: whether the 128-bit LEA UUID appears in adv or scan
+response is UNCONFIRMED, so a pure adv filter would be unreliable.
+Implementation:
+
+- **Stage 1 (adv):** scanned devices whose advertised service UUIDs include
+  the LEA service appear in the list immediately.
+- **Stage 2 (verify):** all other scan results (and OS-bonded BLE devices)
+  are collected as candidates. After the scan stops, each candidate is
+  briefly connected (6 s connect timeout, 8 s discovery timeout), services
+  are discovered, and only devices exposing the LEA service are added to
+  the list. Non-matches never appear. Verdicts are cached for the app
+  session; verification is sequential, RSSI-sorted, capped at 10 devices
+  per scan, and never touches an already-connected device.
+- The device list is now MFi-only on this branch. Brand adapters are still
+  compiled in, but non-MFi devices are filtered out of the UI (the branch
+  is a universal-MFi remote; brand-specific control stays on `main`).
+
+### 2. Binaural set auto-pairing
+
+- **Grouping heuristics** (brand-agnostic, in `buildMfiSetEntries`):
+  1. Normalize device name, stripping a trailing side marker
+     (` L`/` R`, `-L`, `_R`, `(L)`, `Left`, `LE`/`RE`, etc.).
+  2. Group by normalized base name (min 2 chars; nameless devices stay
+     single).
+  3. Pair within a group: explicit L+R side match scores highest; RSSI
+     delta ≤ 15 dB required otherwise; matching MAC OUI prefix is a weak
+     corroborator. Two members with the SAME explicit side are never paired.
+- **Primary selection:** the RIGHT member when sides are known (ear-to-ear
+  convention), otherwise the stronger-RSSI member. The set list entry's id
+  is the primary's id; name shows as "<Base> L+R" with an "L+R" badge.
+- **Connect:** tapping a set runs `connectMfiSet` → one `MfiAdapter`
+  bonds + connects BOTH aids (`connectSet(primary, secondary, side)`),
+  reusing the same connect/bond/discover/LEA-verify path per aid. If the
+  secondary fails (off / out of range), the adapter continues single-sided
+  with the primary — no error. If side info was missing from names, the
+  HAP side characteristic `8d17ac2f` is read opportunistically (generic,
+  guarded — not brand logic).
+- **Slots/UI:** the ONE shared adapter instance is assigned to BOTH ear
+  slots, each with its own aid's battery via `refreshSetState()` →
+  `DriverState.batteryPercent` (per-ear) / `batteryPercentSecondary`.
+  Result: two battery indicators (existing slot cards + ControlPanel
+  battery rows), one linked volume/program control surface.
+- **Write policy (configurable):** binaural aids sync volume/program
+  between ears over their own ear-to-ear link, so by default
+  `adapter.writeToBoth = false` and volume/mute/program writes go to the
+  PRIMARY aid only; the secondary is observed via notifications (its
+  attenuation/program notifications confirm the sync and update the shared
+  cache). Set `writeToBoth = true` for sets that don't sync between ears.
+- **Per-ear writes:** in unlinked mode the left/right sliders call
+  `setVolume(level, 'left'|'right')`, which the MFi adapter routes to the
+  specific aid. Brand adapters ignore the `ear` param (one aid per
+  adapter), so the shared ControlPanel change is safe for them.
+- **Disconnect robustness:** tearing down a slot whose adapter is shared
+  with the peer slot (MFi set) clears both slots. `ControlPanel` dedupes
+  adapter instances so linked volume/mute/program write exactly once.
+- **Slot conflict:** if a set is tapped while other devices occupy the
+  slots, the UI offers "Replace & Connect Pair" (disconnects existing
+  slots, then connects the set).
+
+### TASK14 — untested (needs live binaural set)
+
+1. Two-stage filter on real hardware: does the LEA UUID appear in adv
+   (stage 1 fast path), or do aids only surface via stage-2 verification?
+   How long does verification take in a busy BLE environment?
+2. Set grouping on the ReSound Vivia pair: do the aids' advertised names
+   differ only by an L/R marker the normalizer strips? If both aids share
+   ONE identical name, grouping relies on base-name + RSSI + OUI and both
+   will pair — verify no false pairing with a neighbor's aids (same model
+   name, similar RSSI is possible in a clinic).
+3. `connectSet`: both bonds complete (two Just Works prompts?); secondary
+   connect during the aids' pairing window (both aids may need to be in
+   pairing mode simultaneously on first bond).
+4. Ear-to-ear sync assumption: volume/program written to primary only —
+   confirm the secondary follows (watch its notifications in the log) on
+   Vivia. If not, set `adapter.writeToBoth = true`.
+5. Side detection: name-based L/R vs `8d17ac2f` read — confirm final slot
+   assignment matches physical ears.
+6. Per-ear (unlinked) volume writes routed to the correct aid.
+7. Single-sided graceful operation: set entry tapped with only one aid
+   powered → connects primary, right slot stays empty.
+8. Battery from BOTH aids displayed and updating via notifications.
+
+### TASK14 — known limitations
+
+- Stage-2 verification briefly connects to nearby non-HA BLE devices
+  (headphones, trackers). No pairing is triggered (service discovery only),
+  and weak-signal (< -85 dBm) devices are skipped, but in a crowded
+  environment verification adds latency after each scan.
+- Verdict cache is session-only; a device rejected while powered off will
+  be re-verified next app start.
+- If two aids of a set advertise identical names AND a third same-model
+  aid is nearby with similar RSSI, mis-pairing is theoretically possible;
+  the RSSI delta + OUI checks mitigate but don't eliminate this.
+
+---
+
+## TASK13 — original notes
+
+Branch: `feature/mfi-control` (from `main` @ d6abce4)
+Date: 2026-08-04
 Task: TASK13 — MFi-only control branch. Universal adapter using ONLY the
 standardized MFi/LEA control surface. No brand cores, no GN crypto, no
 POLARIS, no ASHA.
@@ -105,10 +236,13 @@ Smoke-test checklist (ReSound Lacerta aids expose the LEA service — March
 
 ## Build
 
-- Command: `cd android && gradlew.bat assembleRelease`
+- Command: `cd android && gradlew.bat assembleRelease` (`build_app.bat`
+  does not exist in the repo)
 - APK path: `android/app/build/outputs/apk/release/app-release.apk`
-- Result: **BUILD SUCCESSFUL** (2026-08-04, 82,340,606 bytes) — compiles
-  clean with all 5 adapters present. `tsc --noEmit` also clean.
+- TASK14 rebuild: **BUILD SUCCESSFUL** (2026-08-04, 82,366,442 bytes) —
+  `tsc --noEmit` clean; all 5 adapters still present, brand adapters
+  byte-identical to main.
+- TASK13 build: BUILD SUCCESSFUL (2026-08-04, 82,340,606 bytes).
 
 ## Commit
 

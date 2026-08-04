@@ -2,8 +2,9 @@
  * HomeScreen — scan for BLE hearing aid devices, show connected device slots,
  * and list scan results. Supports dual (left + right) hearing aid connections.
  */
-import React, { useCallback, useEffect, useRef } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
+  ActivityIndicator,
   FlatList,
   Platform,
   StyleSheet,
@@ -15,6 +16,14 @@ import { PERMISSIONS, request, requestMultiple } from 'react-native-permissions'
 import { useDeviceStore } from '../store/deviceStore';
 import type { DeviceSlot } from '../store/deviceStore';
 import { startScan, getBondedDevices } from '../ble/scanner';
+import {
+  advertisesLeaService,
+  buildMfiSetEntries,
+  getCachedVerdict,
+  isVerificationCandidate,
+  verifyMfiDevice,
+  MAX_VERIFICATIONS_PER_SCAN,
+} from '../ble/mfiSets';
 import type { DiscoveredDevice } from '../ble/types';
 import type { StackNavigationProp } from '@react-navigation/stack';
 import type { RootStackParamList } from '../../App';
@@ -133,11 +142,70 @@ export function HomeScreen({ navigation }: HomeScreenProps) {
   } = useDeviceStore();
   const stopScanRef = useRef<(() => void) | null>(null);
 
+  // Stage-2 filter state: scanned devices that don't advertise the LEA UUID
+  // are collected here and verified (brief connect + service discovery) after
+  // the scan stops. Only verified MFi devices ever enter the list (TASK14).
+  const candidatesRef = useRef(new Map<string, DiscoveredDevice>());
+  const verifyingRef = useRef(false);
+  const [verifyingCount, setVerifyingCount] = useState(0);
+
+  /**
+   * Stage-2 verification: connect briefly to each candidate and check for the
+   * LEA service. Verified devices are added to the list as 'mfi'; the rest
+   * are hidden permanently (session-cached verdict in mfiSets).
+   */
+  const runVerification = useCallback(async () => {
+    if (verifyingRef.current) return;
+    verifyingRef.current = true;
+    try {
+      const { leftDevice: left, rightDevice: right } = useDeviceStore.getState();
+      const connectedIds = new Set(
+        [left?.deviceId, right?.deviceId].filter(Boolean) as string[],
+      );
+      const candidates = Array.from(candidatesRef.current.values())
+        .filter((d) => !connectedIds.has(d.id) && isVerificationCandidate(d))
+        .sort((a, b) => (b.rssi ?? -999) - (a.rssi ?? -999))
+        .slice(0, MAX_VERIFICATIONS_PER_SCAN);
+
+      setVerifyingCount(candidates.length);
+      for (const candidate of candidates) {
+        candidatesRef.current.delete(candidate.id);
+        setVerifyingCount((n) => Math.max(0, n - 1));
+        try {
+          const result = await verifyMfiDevice(candidate.id);
+          if (result.ok) {
+            addDiscoveredDevice({
+              ...candidate,
+              brand: 'mfi',
+              name:
+                candidate.name ??
+                (result.manufacturer
+                  ? `MFi hearing aid (${result.manufacturer})`
+                  : 'MFi hearing aid'),
+            });
+          }
+        } catch {
+          // verification failure — device stays hidden
+        }
+      }
+    } finally {
+      verifyingRef.current = false;
+      setVerifyingCount(0);
+    }
+  }, [addDiscoveredDevice]);
+
+  const stopScanAndVerify = useCallback(() => {
+    if (stopScanRef.current) {
+      stopScanRef.current();
+      stopScanRef.current = null;
+    }
+    setScanning(false);
+    void runVerification();
+  }, [setScanning, runVerification]);
+
   const handleScan = useCallback(async () => {
     if (isScanning) {
-      stopScanRef.current?.();
-      stopScanRef.current = null;
-      setScanning(false);
+      stopScanAndVerify();
       return;
     }
 
@@ -145,45 +213,62 @@ export function HomeScreen({ navigation }: HomeScreenProps) {
     if (!granted) return;
 
     clearDiscoveredDevices();
+    candidatesRef.current.clear();
     setScanning(true);
 
-    // Re-show OS-paired BLE devices so they are not lost after clear
+    // Re-verify OS-paired BLE devices — only MFi ones are shown
     try {
       const bonded = await getBondedDevices();
       for (const d of bonded) {
-        addDiscoveredDevice(d);
+        const verdict = getCachedVerdict(d.id);
+        if (verdict === 'verified') {
+          addDiscoveredDevice({ ...d, brand: 'mfi' });
+        } else if (verdict !== 'rejected') {
+          candidatesRef.current.set(d.id, d);
+        }
       }
+      void runVerification();
     } catch {
       // ignore
     }
 
     stopScanRef.current = startScan((device) => {
-      addDiscoveredDevice(device);
+      // Stage 1: devices advertising the LEA service UUID show immediately.
+      if (device.brand === 'mfi' || advertisesLeaService(device.serviceUUIDs)) {
+        addDiscoveredDevice({ ...device, brand: 'mfi' });
+        return;
+      }
+      // Everything else: stage-2 candidate, verified after scan stops.
+      candidatesRef.current.set(device.id, device);
     });
 
     // Auto-stop after 15 seconds
     setTimeout(() => {
       if (stopScanRef.current) {
-        stopScanRef.current();
-        stopScanRef.current = null;
-        setScanning(false);
+        stopScanAndVerify();
       }
     }, 15000);
-  }, [isScanning, setScanning, addDiscoveredDevice, clearDiscoveredDevices]);
+  }, [isScanning, setScanning, addDiscoveredDevice, clearDiscoveredDevices, stopScanAndVerify, runVerification]);
 
-  // Load already-bonded devices on mount
+  // Load already-bonded MFi devices on mount (verified via stage 2)
   useEffect(() => {
     void (async () => {
       try {
         const bonded = await getBondedDevices();
         for (const d of bonded) {
-          addDiscoveredDevice(d);
+          const verdict = getCachedVerdict(d.id);
+          if (verdict === 'verified') {
+            addDiscoveredDevice({ ...d, brand: 'mfi' });
+          } else if (verdict !== 'rejected') {
+            candidatesRef.current.set(d.id, d);
+          }
         }
+        void runVerification();
       } catch {
         // Bonded device query may fail if BLE not ready
       }
     })();
-  }, [addDiscoveredDevice]);
+  }, [addDiscoveredDevice, runVerification]);
 
   useEffect(() => {
     return () => {
@@ -195,6 +280,7 @@ export function HomeScreen({ navigation }: HomeScreenProps) {
     async (side: 'left' | 'right') => {
       const device = side === 'left' ? leftDevice : rightDevice;
       if (!device) return;
+      const other = side === 'left' ? rightDevice : leftDevice;
       try {
         await device.adapter.disconnect();
       } catch {
@@ -206,14 +292,28 @@ export function HomeScreen({ navigation }: HomeScreenProps) {
         // ignore
       }
       setDeviceSlot(side, null);
+      // An MFi binaural set shares ONE adapter across both slots — tearing
+      // down the adapter disconnects both aids, so clear the peer slot too.
+      if (other && other.adapter === device.adapter) {
+        try {
+          await getBleManager().cancelDeviceConnection(other.deviceId);
+        } catch {
+          // ignore
+        }
+        setDeviceSlot(side === 'left' ? 'right' : 'left', null);
+      }
     },
     [leftDevice, rightDevice, setDeviceSlot],
   );
 
   const handleDevicePress = useCallback(
     (device: DiscoveredDevice) => {
-      // Don't re-connect an already connected device
-      if (leftDevice?.deviceId === device.id || rightDevice?.deviceId === device.id) {
+      // Don't re-connect an already connected device (or set member)
+      const connectedIds = [leftDevice?.deviceId, rightDevice?.deviceId].filter(Boolean);
+      if (
+        connectedIds.includes(device.id) ||
+        device.setMemberIds?.some((id) => connectedIds.includes(id))
+      ) {
         return;
       }
       stopScanRef.current?.();
@@ -226,52 +326,71 @@ export function HomeScreen({ navigation }: HomeScreenProps) {
 
   const hasAnyConnection = leftDevice != null || rightDevice != null;
 
-  // Filter out already-connected devices from the scan list
+  // Filter out already-connected devices (and set members) from the scan list
+  const connectedIdSet = new Set(
+    [leftDevice?.deviceId, rightDevice?.deviceId].filter(Boolean) as string[],
+  );
   const filteredDevices = discoveredDevices.filter(
-    (d) => d.id !== leftDevice?.deviceId && d.id !== rightDevice?.deviceId,
+    (d) =>
+      !connectedIdSet.has(d.id) &&
+      !d.setMemberIds?.some((id) => connectedIdSet.has(id)),
   );
 
-  const renderDevice = ({ item }: { item: DiscoveredDevice }) => (
-    <TouchableOpacity
-      style={styles.deviceCard}
-      onPress={() => handleDevicePress(item)}
-      activeOpacity={0.7}>
-      <View style={styles.deviceHeader}>
-        <Text style={styles.deviceName}>{item.name ?? 'Unknown Device'}</Text>
-        <View style={styles.badgeRow}>
-          {item.bonded && (
-            <View style={styles.pairedBadge}>
-              <Text style={styles.pairedText}>Paired</Text>
+  // Group verified MFi devices into binaural set entries (one "L+R" row per
+  // detected pair). Singles pass through unchanged.
+  const groupedDevices = buildMfiSetEntries(filteredDevices);
+
+  const renderDevice = ({ item }: { item: DiscoveredDevice }) => {
+    const isSet = (item.setMemberIds?.length ?? 0) === 2;
+    return (
+      <TouchableOpacity
+        style={styles.deviceCard}
+        onPress={() => handleDevicePress(item)}
+        activeOpacity={0.7}>
+        <View style={styles.deviceHeader}>
+          <Text style={styles.deviceName}>{item.name ?? 'MFi hearing aid'}</Text>
+          <View style={styles.badgeRow}>
+            {isSet && (
+              <View style={styles.setBadge}>
+                <Text style={styles.setBadgeText}>L+R</Text>
+              </View>
+            )}
+            {item.bonded && (
+              <View style={styles.pairedBadge}>
+                <Text style={styles.pairedText}>Paired</Text>
+              </View>
+            )}
+            <View
+              style={[
+                styles.brandBadge,
+                { backgroundColor: BRAND_COLORS[item.brand] ?? '#888' },
+              ]}>
+              <Text style={styles.brandText}>{BRAND_LABELS[item.brand] ?? item.brand}</Text>
             </View>
-          )}
-          <View
-            style={[
-              styles.brandBadge,
-              { backgroundColor: BRAND_COLORS[item.brand] ?? '#888' },
-            ]}>
-            <Text style={styles.brandText}>{BRAND_LABELS[item.brand] ?? item.brand}</Text>
           </View>
         </View>
-      </View>
-      {item.brand === 'unknown' && (
-        <Text style={styles.unknownHint}>Unknown hearing aid — tap to identify</Text>
-      )}
-      <Text style={styles.deviceId}>{item.id}</Text>
-      {item.rssi != null && (
-        <View style={styles.signalRow}>
-          <Text style={[styles.rssi, { color: signalStrengthColor(item.rssi) }]}>
-            {signalStrengthLabel(item.rssi)} ({item.rssi} dBm)
+        {isSet && (
+          <Text style={styles.setHint}>
+            Binaural set — both aids connect together
           </Text>
-        </View>
-      )}
-    </TouchableOpacity>
-  );
+        )}
+        <Text style={styles.deviceId}>{item.id}</Text>
+        {item.rssi != null && (
+          <View style={styles.signalRow}>
+            <Text style={[styles.rssi, { color: signalStrengthColor(item.rssi) }]}>
+              {signalStrengthLabel(item.rssi)} ({item.rssi} dBm)
+            </Text>
+          </View>
+        )}
+      </TouchableOpacity>
+    );
+  };
 
   return (
     <View style={styles.container}>
       <Text style={styles.title}>Hearing Aid Controller</Text>
       <Text style={styles.subtitle}>
-        Scan for nearby Bluetooth devices
+        MFi hearing aids only — binaural pairs appear as one "L+R" entry
       </Text>
 
       {/* Connected device slots */}
@@ -306,24 +425,35 @@ export function HomeScreen({ navigation }: HomeScreenProps) {
         </Text>
       </TouchableOpacity>
 
-      {filteredDevices.length > 0 && (
+      {verifyingCount > 0 && (
+        <View style={styles.verifyRow}>
+          <ActivityIndicator size="small" color="#6A5ACD" />
+          <Text style={styles.verifyText}>
+            Verifying MFi devices ({verifyingCount})...
+          </Text>
+        </View>
+      )}
+
+      {groupedDevices.length > 0 && (
         <>
           <Text style={styles.resultsLabel}>
-            {filteredDevices.length} device{filteredDevices.length !== 1 ? 's' : ''} found
+            {groupedDevices.length} MFi device{groupedDevices.length !== 1 ? 's' : ''} found
           </Text>
-          <Text style={styles.tapHint}>Tap any device to connect</Text>
+          <Text style={styles.tapHint}>Tap a device or pair to connect</Text>
         </>
       )}
 
       <FlatList
-        data={filteredDevices}
+        data={groupedDevices}
         keyExtractor={(item) => item.id}
         renderItem={renderDevice}
         contentContainerStyle={styles.list}
         ListEmptyComponent={
           !isScanning ? (
             <Text style={styles.emptyText}>
-              Press "Scan for Devices" to find nearby hearing aids
+              {verifyingCount > 0
+                ? 'Verifying nearby devices...'
+                : 'Press "Scan for Devices" to find nearby MFi hearing aids'}
             </Text>
           ) : (
             <Text style={styles.emptyText}>Scanning...</Text>
@@ -498,6 +628,33 @@ const styles = StyleSheet.create({
     paddingVertical: 3,
     borderRadius: 6,
     backgroundColor: '#4CAF50',
+  },
+  setBadge: {
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderRadius: 6,
+    backgroundColor: '#6A5ACD',
+  },
+  setBadgeText: {
+    color: '#FFF',
+    fontSize: 11,
+    fontWeight: '700',
+  },
+  setHint: {
+    fontSize: 12,
+    color: '#6A5ACD',
+    fontStyle: 'italic',
+    marginBottom: 2,
+  },
+  verifyRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    marginBottom: 10,
+  },
+  verifyText: {
+    fontSize: 13,
+    color: '#6A5ACD',
   },
   pairedText: {
     color: '#FFF',

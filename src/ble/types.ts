@@ -9,6 +9,16 @@ export interface DiscoveredDevice {
   brand: Brand;
   serviceUUIDs: string[];
   bonded?: boolean;
+  /**
+   * Binaural set fields (MFi adapter only). When the entry represents a
+   * left+right pair presented as one list item, `id` is the PRIMARY member's
+   * id and `setMemberIds` lists both members. Absent for single devices.
+   */
+  setMemberIds?: string[];
+  /** Ear side per member id (name-derived or side-characteristic read) */
+  memberSides?: { [deviceId: string]: 'left' | 'right' };
+  /** Display name per member id (before set merging) */
+  memberNames?: { [deviceId: string]: string | null };
 }
 
 export interface DeviceInfo {

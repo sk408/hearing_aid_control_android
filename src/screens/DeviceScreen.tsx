@@ -23,6 +23,7 @@ import type { Brand, DiscoveredDevice } from '../ble/types';
 import { getBleManager } from '../ble/BleManager';
 import { detectBrandFromDiscovery } from '../brand/detection';
 import { createAdapter } from '../adapters/factory';
+import { MfiAdapter } from '../adapters/mfiAdapter';
 import { useDeviceStore } from '../store/deviceStore';
 import type { EarSide } from '../store/deviceStore';
 import type { HearingAidAdapter } from '../adapters/types';
@@ -64,11 +65,13 @@ function base64ToBytes(base64: string): number[] {
 
 type ConnectionState =
   | { status: 'connecting' }
+  | { status: 'connecting_set' }
   | { status: 'discovering' }
   | { status: 'detecting_side' }
   | { status: 'pick_side' }
   | { status: 'assigned'; side: EarSide; brand: Brand }
   | { status: 'slot_full'; side: EarSide }
+  | { status: 'slot_conflict' }
   | { status: 'unsupported' }
   | { status: 'error'; message: string };
 
@@ -158,7 +161,124 @@ export function DeviceScreen({ route }: DeviceScreenProps) {
     [device.id, device.name, leftDevice, rightDevice, setDeviceSlot],
   );
 
+  /**
+   * MFi binaural set connect flow (TASK14). The tapped list entry represents
+   * BOTH aids: bond+connect both through one MfiAdapter, then assign the
+   * shared adapter to both ear slots with per-ear battery state.
+   * Brand-agnostic: sides come from the set entry (name-derived) with an
+   * opportunistic read of the generic HAP side characteristic as refinement.
+   */
+  const connectMfiSet = useCallback(async () => {
+    const manager = getBleManager();
+    const memberIds = device.setMemberIds!;
+    const primaryId = device.id; // set entry id is the primary member
+    const secondaryId = memberIds.find((id) => id !== primaryId)!;
+
+    // Both slots must be free (or already hold members of this set)
+    const occupiedByOther = [leftDevice, rightDevice].some(
+      (s) => s && s.deviceId !== primaryId && s.deviceId !== secondaryId,
+    );
+    if (occupiedByOther) {
+      setState({ status: 'slot_conflict' });
+      return;
+    }
+
+    try {
+      setState({ status: 'connecting_set' });
+      logBleOp('mfiSet.connect', 'connecting BOTH aids...');
+
+      const adapter = new MfiAdapter();
+      adapterRef.current = adapter;
+      adapter.onRebootRequired = (message) => {
+        Alert.alert('Reboot Required', message, [{ text: 'OK' }]);
+      };
+      adapter.onAndroidBondingRequired = () => {
+        Alert.alert(
+          'Bluetooth Pairing',
+          'A Bluetooth pairing request may appear for EACH aid — please accept both to continue.',
+          [{ text: 'OK' }],
+        );
+      };
+
+      const nameSides = device.memberSides ?? {};
+      await adapter.connectSet(primaryId, secondaryId, nameSides[primaryId] ?? 'right');
+
+      // Refine sides via the HAP side characteristic when names gave no hint
+      if (!nameSides[primaryId]) {
+        try {
+          const pServices = (await manager.servicesForDevice(primaryId)).map((s) => s.uuid);
+          const pSide = await readEarSide(primaryId, pServices, new Map());
+          if (pSide) {
+            adapter.primarySide = pSide;
+          } else if (adapter.isSet) {
+            const sServices = (await manager.servicesForDevice(secondaryId)).map((s) => s.uuid);
+            const sSide = await readEarSide(secondaryId, sServices, new Map());
+            if (sSide) adapter.primarySide = sSide === 'left' ? 'right' : 'left';
+          }
+        } catch {
+          // keep default (right)
+        }
+      }
+      logBleOp(
+        'mfiSet.connect',
+        adapter.isSet ? 'OK — both aids connected' : 'OK — primary only (secondary unavailable)',
+      );
+
+      const primarySide = adapter.primarySide;
+      const secondarySide: EarSide = primarySide === 'left' ? 'right' : 'left';
+      const names = device.memberNames ?? {};
+
+      logBleOp('refreshSetState', 'in progress...');
+      const setStates = await adapter.refreshSetState().catch(() => null);
+
+      if (setStates) {
+        setDeviceSlot(primarySide, {
+          deviceId: primaryId,
+          deviceName: names[primaryId] ?? device.name,
+          brand: 'mfi',
+          adapter,
+          driverState: setStates.primary,
+        });
+        setDeviceSlot(secondarySide, {
+          deviceId: secondaryId,
+          deviceName: names[secondaryId] ?? device.name,
+          brand: 'mfi',
+          adapter,
+          driverState: setStates.secondary,
+        });
+        logBleOp('refreshSetState', 'OK');
+      } else {
+        // Secondary aid unavailable — single-sided graceful fallback
+        const single = await adapter.refreshState().catch(() => null);
+        setDeviceSlot(primarySide, {
+          deviceId: primaryId,
+          deviceName: names[primaryId] ?? device.name,
+          brand: 'mfi',
+          adapter,
+          driverState: single,
+        });
+        logBleOp('refreshSetState', 'secondary unavailable — single-sided');
+      }
+
+      assignedRef.current = true;
+      setState({ status: 'assigned', side: primarySide, brand: 'mfi' });
+      setTimeout(() => {
+        navigation.replace('DualControl');
+      }, 800);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Connection failed';
+      logBleOp('mfiSet.connect', `FAILED: ${message}`);
+      setState({ status: 'error', message });
+    }
+  }, [device, leftDevice, rightDevice, setDeviceSlot, logBleOp, navigation]);
+
   const connectAndIdentify = useCallback(async () => {
+    // MFi binaural set entries take the dedicated dual-connect path
+    if (device.brand === 'mfi' && (device.setMemberIds?.length ?? 0) === 2) {
+      await connectMfiSet();
+      return;
+    }
+
     const manager = getBleManager();
 
     try {
@@ -332,6 +452,23 @@ export function DeviceScreen({ route }: DeviceScreenProps) {
     [device.brand, leftDevice, rightDevice, setDeviceSlot, assignToSlot, navigation],
   );
 
+  const handleResolveConflict = useCallback(async () => {
+    // Disconnect whatever currently occupies the slots, then retry the set
+    for (const side of ['left', 'right'] as EarSide[]) {
+      const existing = side === 'left' ? leftDevice : rightDevice;
+      if (!existing) continue;
+      if (side === 'right' && leftDevice && existing.adapter === leftDevice.adapter) {
+        // shared adapter (MFi set) — already torn down with the left slot
+        setDeviceSlot('right', null);
+        continue;
+      }
+      try { await existing.adapter.disconnect(); } catch { /* ignore */ }
+      try { await getBleManager().cancelDeviceConnection(existing.deviceId); } catch { /* ignore */ }
+      setDeviceSlot(side, null);
+    }
+    await connectMfiSet();
+  }, [leftDevice, rightDevice, setDeviceSlot, connectMfiSet]);
+
   const [diagExpanded, setDiagExpanded] = useState(false);
 
   return (
@@ -348,6 +485,15 @@ export function DeviceScreen({ route }: DeviceScreenProps) {
         <View style={styles.statusContainer}>
           <ActivityIndicator size="large" color="#0066CC" />
           <Text style={styles.statusText}>Connecting...</Text>
+        </View>
+      )}
+
+      {state.status === 'connecting_set' && (
+        <View style={styles.statusContainer}>
+          <ActivityIndicator size="large" color="#6A5ACD" />
+          <Text style={styles.statusText}>
+            Connecting BOTH hearing aids...{'\n'}Accept pairing requests for each aid if prompted.
+          </Text>
         </View>
       )}
 
@@ -412,6 +558,24 @@ export function DeviceScreen({ route }: DeviceScreenProps) {
               <Text style={styles.sideButtonText}>
                 Use {state.side === 'left' ? 'Right' : 'Left'} Ear
               </Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      )}
+
+      {state.status === 'slot_conflict' && (
+        <View style={styles.pickSideCard}>
+          <Text style={styles.pickSideTitle}>Other devices are connected</Text>
+          <Text style={styles.pickSideBody}>
+            Connecting this pair will disconnect the currently connected
+            device(s).
+          </Text>
+          <View style={styles.pickSideRow}>
+            <TouchableOpacity
+              style={[styles.sideButton, { backgroundColor: '#CC6600' }]}
+              onPress={handleResolveConflict}
+              activeOpacity={0.7}>
+              <Text style={styles.sideButtonText}>Replace & Connect Pair</Text>
             </TouchableOpacity>
           </View>
         </View>
